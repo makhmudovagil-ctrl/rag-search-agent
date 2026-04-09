@@ -1,0 +1,21 @@
+# Agent Engine deployment — slim dependencies (no FastAPI, no PostgreSQL)
+#
+# Usage:
+#   pip install -r requirements_agent_engine.txt          # local dev
+#   Pass these as "requirements" list in agent_engines.create() config
+
+# Google Agent Engine + ADK
+google-cloud-aiplatform[agent_engines,adk]>=1.112
+google-adk>=1.0.0
+
+# Data validation
+pydantic>=2.7,<3.0
+
+# Exa neural search — optional second search source for Scout agent
+exa-py>=2.0.0
+
+# Structured logging
+structlog>=24.1,<26.0
+
+# Async HTTP (used by tools)
+httpx>=0.27,<1.0
