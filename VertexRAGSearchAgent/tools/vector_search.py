@@ -2,24 +2,37 @@
 Vector Search Tool — semantic expert discovery via Vertex AI + Spanner.
 
 Embeds the query text with Vertex AI `text-embedding-005`
-(task_type=RETRIEVAL_QUERY) and ranks experts by
-`COSINE_DISTANCE(knowledge_artifact.text_embedding, @query_embedding)`.
+(task_type=RETRIEVAL_QUERY) and ranks experts by cosine distance against
+**two** embedding corpora, UNION-ed and deduplicated per expert:
 
-The knowledge_artifact.text_embedding column was populated by
-`scripts/migrations/07_generate_embeddings.py` on 2026-04-11 for all
-473 eligible rows.
+  1. `knowledge_artifact.text_embedding` (473 rows; transcripts, bios, Q&A)
+  2. `employment_record.responsibilities_embedding` (5,569 rows; free-form
+     job responsibilities)
 
-Path from artifact to expert:
-    knowledge_artifact
+Both columns were populated by `scripts/migrations/07_generate_embeddings.py`
+on 2026-04-11. Including the responsibility side closes the recall gap for
+duty-oriented queries ("managed a P&L", "oversaw plant operations",
+"navigated SAP transition") where the responsibility corpus is ~12× larger
+than the artifact corpus and matches such queries much more tightly.
+
+Path from match row to expert:
+  - artifact path:
+      knowledge_artifact
         → edge_relevant_employment (M:N, carries context_type)
         → employment_record
         → expert
-    + LEFT JOIN edge_at_company → company   (for jobtitle/company context)
+  - responsibility path:
+      employment_record → expert  (direct — responsibilities live on er itself)
+  - both paths: LEFT JOIN edge_at_company → company  (for role/company context)
 
-The SQL collapses multiple artifacts per expert using
-`ROW_NUMBER() OVER (PARTITION BY expert_id ORDER BY distance ASC)` and
-keeps only each expert's best-matching artifact, so the caller sees one
-row per expert ranked by semantic similarity.
+Each result row is tagged with a `match_source` field ("artifact" or
+"responsibility") so downstream (Synthesizer) can cite the right evidence.
+
+Dedup-by-expert is done in Python: rows are fetched ordered by distance
+ASC, and a simple first-wins pass keeps each expert's single best match
+across both sources. We over-fetch (`limit * 10`) to guarantee enough
+unique experts after dedup even when one expert has many high-scoring
+matches across both corpora.
 """
 
 import logging
@@ -101,30 +114,45 @@ def _embed_query(query_text: str) -> list[float]:
 # ── Ranking SQL ────────────────────────────────────────────────────────────────
 #
 # Design notes:
-#   1. We filter out artifacts without an embedding so the distance
-#      computation only runs on populated rows.
-#   2. We over-fetch (`LIMIT @fetch_limit`) so that after deduping by
-#      expert in Python we still have enough unique experts to fill the
-#      caller's `@limit`. A simple heuristic of `limit * 5` is plenty.
-#   3. Dedup-by-expert is done in Python instead of SQL because the
-#      Spanner GoogleSQL surface on this instance does **not** expose
-#      `ROW_NUMBER() OVER (PARTITION BY ...)` as a built-in (verified
-#      2026-04-11: "501 Unsupported built-in function: ROW_NUMBER").
-#      Since we only pull a few dozen rows, Python-side dedup is cheap
-#      and easy to reason about.
-#   4. `edge_at_company` is LEFT-joined because a handful of historical
-#      employment records lack a company assignment — we'd rather return
-#      them with NULL company than drop them silently.
-#   5. `artifact_type` is useful context for the Synthesizer ("call
-#      transcript" vs. "bio" vs. "qa") — included in the projection.
+#   1. Single SQL query with `UNION ALL` over two embedding corpora.
+#      Spanner sorts the merged result server-side so we get a global
+#      ordering by distance, not a per-source one.
+#   2. `match_source` ("artifact" | "responsibility") tags every row so
+#      the Synthesizer can cite the right evidence.
+#   3. `match_id` holds `artifact_id` on the artifact side and
+#      `employment_id` on the responsibility side — same STRING type, so
+#      the UNION column types line up.
+#   4. `CAST(NULL AS STRING)` is required for the responsibility side
+#      because UNION ALL needs exactly-matching column types across
+#      branches — the responsibility path has no artifact_type and no
+#      context_type, so we surface them as NULL.
+#   5. We over-fetch (`LIMIT @fetch_limit`) so that after Python-side
+#      dedup-by-expert we still have enough unique experts to fill the
+#      caller's `@limit`. Heuristic: `limit * 10` — doubled from the
+#      pre-UNION value because one expert can now appear twice (once via
+#      artifact, once via responsibility) within the top-K distances.
+#   6. Dedup-by-expert is done in Python, not SQL, because this Spanner
+#      instance does NOT expose `ROW_NUMBER() OVER (PARTITION BY ...)`
+#      (verified 2026-04-11: "501 Unsupported built-in function:
+#      ROW_NUMBER"). Python-side first-wins dedup is cheap (a few dozen
+#      rows) and easy to reason about.
+#   7. `edge_at_company` is LEFT-joined on both branches because a
+#      handful of historical employment records lack a company
+#      assignment — we'd rather return them with NULL company than drop
+#      them silently.
+#   8. The artifact branch joins via `edge_relevant_employment` to
+#      identify *which* employment an artifact is about. The
+#      responsibility branch needs no such edge — responsibilities live
+#      on `employment_record` itself, so `er.expert_id` is the direct path.
 
 _VECTOR_SEARCH_SQL = """
 SELECT
     e.expert_id,
     e.expert_name,
-    ka.artifact_id,
-    ka.artifact_type,
-    ka.text AS artifact_text,
+    'artifact' AS match_source,
+    ka.artifact_id AS match_id,
+    ka.artifact_type AS match_type,
+    ka.text AS match_text,
     er.employment_id,
     er.jobtitle_raw,
     er.is_current,
@@ -145,13 +173,45 @@ LEFT JOIN edge_at_company eac
 LEFT JOIN company c
     ON eac.company_id = c.company_id
 WHERE ka.text_embedding IS NOT NULL
+
+UNION ALL
+
+SELECT
+    e.expert_id,
+    e.expert_name,
+    'responsibility' AS match_source,
+    er.employment_id AS match_id,
+    CAST(NULL AS STRING) AS match_type,
+    er.responsibilities AS match_text,
+    er.employment_id,
+    er.jobtitle_raw,
+    er.is_current,
+    er.start_year,
+    er.end_year,
+    CAST(NULL AS STRING) AS context_type,
+    c.company_name,
+    COSINE_DISTANCE(er.responsibilities_embedding, @q_emb) AS distance
+FROM employment_record er
+JOIN expert e
+    ON er.expert_id = e.expert_id
+LEFT JOIN edge_at_company eac
+    ON er.employment_id = eac.employment_id
+LEFT JOIN company c
+    ON eac.company_id = c.company_id
+WHERE er.responsibilities_embedding IS NOT NULL
+
 ORDER BY distance ASC
 LIMIT @fetch_limit
 """
 
 
 def _truncate_text(text: Optional[str], max_chars: int = 1500) -> Optional[str]:
-    """Trim long artifact_text so the Synthesizer prompt stays compact."""
+    """Trim long match_text so the Synthesizer prompt stays compact.
+
+    Applied to both artifact.text and employment_record.responsibilities;
+    responsibilities are usually short, but long-form transcripts can
+    blow up the Synthesizer prompt if not capped.
+    """
     if text is None:
         return None
     if len(text) <= max_chars:
@@ -165,12 +225,14 @@ def search_experts_by_vector(
     query_text: str,
     limit: int = _DEFAULT_LIMIT,
 ) -> dict:
-    """Semantic expert search over knowledge artifacts via vector similarity.
+    """Semantic expert search via vector similarity over two corpora.
 
     Embeds `query_text` with Vertex AI `text-embedding-005`
     (task_type=RETRIEVAL_QUERY) and ranks experts by the cosine distance
-    between the query embedding and each artifact's `text_embedding`.
-    One best-matching artifact is kept per expert.
+    between the query embedding and both
+    `knowledge_artifact.text_embedding` and
+    `employment_record.responsibilities_embedding`. One best-matching
+    row per expert is kept, whichever corpus it came from.
 
     Args:
         query_text: Free-text query for semantic matching.
@@ -179,8 +241,18 @@ def search_experts_by_vector(
     Returns:
         dict with keys:
             - query_type: always "vector"
-            - count: number of rows returned
-            - results: list of dicts (expert + best artifact + company)
+            - count: number of experts returned
+            - results: list of dicts, each containing:
+                - expert_id, expert_name
+                - match_source: "artifact" | "responsibility"
+                - match_id: artifact_id or employment_id (depending on source)
+                - match_type: artifact_type (e.g. "Transcript") or None
+                - match_text: the matched chunk, truncated to 1500 chars
+                - employment_id, jobtitle_raw, is_current, start_year, end_year
+                - context_type (artifact branch only)
+                - company_name (may be None)
+                - distance: cosine distance (lower = better)
+                - similarity: 1 - distance (higher = better)
             - error: present only when the call failed
     """
     if not query_text or not query_text.strip():
@@ -202,14 +274,15 @@ def search_experts_by_vector(
             "error": f"embedding_failed: {type(e).__name__}: {e}",
         }
 
+    # Over-fetch multiplier: doubled from 5 (pre-UNION) to 10 because a
+    # single expert can now contribute up to two rows (one artifact match
+    # + one responsibility match) within the top-K distances.
     params = {
         "q_emb": query_embedding,
-        "limit": int(limit),
-        "fetch_limit": int(limit) * 5,
+        "fetch_limit": int(limit) * 10,
     }
     param_types = {
         "q_emb": spanner.param_types.Array(spanner.param_types.FLOAT32),
-        "limit": spanner.param_types.INT64,
         "fetch_limit": spanner.param_types.INT64,
     }
 
@@ -232,9 +305,12 @@ def search_experts_by_vector(
             "error": f"spanner_failed: {type(e).__name__}: {e}",
         }
 
-    # Dedup by expert_id, keeping the first (closest) occurrence. Rows are
-    # already ordered by distance ASC in the SQL, so a simple "first wins"
-    # pass gives each expert their best-matching artifact.
+    # Dedup by expert_id, keeping the first (closest) occurrence across
+    # both UNION branches. Rows are already ordered by distance ASC in
+    # the SQL, so a simple "first wins" pass gives each expert their
+    # single best match — whether it came from an artifact or a
+    # responsibility. The match_source field on each kept row tells the
+    # Synthesizer which corpus the evidence came from.
     seen_experts: set[str] = set()
     results: list[dict] = []
     for row in rows:
@@ -244,8 +320,8 @@ def search_experts_by_vector(
             continue
         seen_experts.add(expert_id)
 
-        # Trim text so downstream prompts stay compact.
-        row_dict["artifact_text"] = _truncate_text(row_dict.get("artifact_text"))
+        # Trim matched text so downstream prompts stay compact.
+        row_dict["match_text"] = _truncate_text(row_dict.get("match_text"))
         # Distance → similarity score (1 - cosine distance), rounded for display.
         distance = row_dict.get("distance")
         if distance is not None:
