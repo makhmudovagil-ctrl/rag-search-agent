@@ -58,7 +58,7 @@ def _build_instruction(ctx: ReadonlyContext) -> str:
     if vector_results:
         parts.append(f"\n## Vector Search Results ({len(vector_results)} experts)\n```json\n{json.dumps(vector_results, default=str, indent=2)}\n```")
     else:
-        parts.append("\n## Vector Search Results\nNo results (vector search not yet active in MVP).")
+        parts.append("\n## Vector Search Results\nNo results found.")
 
     return "\n".join(parts)
 
