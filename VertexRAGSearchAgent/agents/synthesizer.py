@@ -14,6 +14,7 @@ from VertexRAGSearchAgent.state import (
     COVERAGE_ESTIMATE,
     DISAMBIGUATION_RESULT,
     GRAPH_RAW_RESULTS,
+    RERANKED_RESULTS,
     ROUTING_DECISION,
     TEMPORAL_RESULTS,
     VECTOR_RAW_RESULTS,
@@ -42,6 +43,9 @@ Your job is to take raw search results and produce a clear, ranked list of exper
 
 Present results as a numbered list. Each entry should be concise but informative.
 End with a brief coverage summary.
+
+If results are pre-ranked (a "Re-ranked Results" section is present), preserve the
+given ranking order — the experts are already sorted by relevance.
 
 CRITICAL: Do NOT fabricate information not present in the search results below.
 If no results were found, say so clearly and suggest alternative search strategies.
@@ -190,21 +194,35 @@ def _build_instruction(ctx: ReadonlyContext) -> str:
     """Build synthesizer instruction with actual search results from state."""
     graph_results = ctx.state.get(GRAPH_RAW_RESULTS, [])
     vector_results = ctx.state.get(VECTOR_RAW_RESULTS, [])
+    reranked = ctx.state.get(RERANKED_RESULTS, [])
     routing = ctx.state.get(ROUTING_DECISION, {})
 
     parts = [_BASE_INSTRUCTION]
 
     parts.append(f"\n## Routing Decision\n```json\n{json.dumps(routing, default=str, indent=2)}\n```")
 
-    if graph_results:
-        parts.append(f"\n## Graph Search Results ({len(graph_results)} experts)\n```json\n{json.dumps(graph_results, default=str, indent=2)}\n```")
+    if reranked:
+        # Use pre-ranked results (P2.1) — single merged section
+        parts.append(
+            f"\n## Re-ranked Results ({len(reranked)} experts, sorted by relevance)\n"
+            f"```json\n{json.dumps(reranked, default=str, indent=2)}\n```"
+        )
+        parts.append(
+            "Results are pre-ranked by relevance. Present them in the given order. "
+            "Each expert has a `ranking_reasoning` field — use it to explain why "
+            "the expert is relevant."
+        )
     else:
-        parts.append("\n## Graph Search Results\nNo results found.")
+        # Fallback to raw results (backwards compatibility)
+        if graph_results:
+            parts.append(f"\n## Graph Search Results ({len(graph_results)} experts)\n```json\n{json.dumps(graph_results, default=str, indent=2)}\n```")
+        else:
+            parts.append("\n## Graph Search Results\nNo results found.")
 
-    if vector_results:
-        parts.append(f"\n## Vector Search Results ({len(vector_results)} experts)\n```json\n{json.dumps(vector_results, default=str, indent=2)}\n```")
-    else:
-        parts.append("\n## Vector Search Results\nNo results found.")
+        if vector_results:
+            parts.append(f"\n## Vector Search Results ({len(vector_results)} experts)\n```json\n{json.dumps(vector_results, default=str, indent=2)}\n```")
+        else:
+            parts.append("\n## Vector Search Results\nNo results found.")
 
     # Coverage diagnostics (P1.3) — only present when results are sparse
     diagnostics = ctx.state.get(COVERAGE_DIAGNOSTICS, {})

@@ -15,6 +15,9 @@ COVERAGE_DIAGNOSTICS = "rag:coverage_diagnostics"   # dict from get_coverage_dia
 # Coverage estimation (P2.4 — "Found X of ~Y experts")
 COVERAGE_ESTIMATE = "rag:coverage_estimate"          # dict from compute_coverage_estimate()
 
+# Re-ranked merged results (P2.1 — Gemini contextual re-ranking)
+RERANKED_RESULTS = "rag:reranked_results"            # list[dict] from run_reranker()
+
 # Entity disambiguation (P1.4 — ambiguous company names)
 DISAMBIGUATION_RESULT = "rag:disambiguation_result"  # dict from check_company_disambiguation()
 
