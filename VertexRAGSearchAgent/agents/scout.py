@@ -24,10 +24,12 @@ from VertexRAGSearchAgent.state import (
     GRAPH_RAW_RESULTS,
     ROUTING_DECISION,
     ROUTING_STRATEGY,
+    TEMPORAL_RESULTS,
     VECTOR_RAW_RESULTS,
 )
 from VertexRAGSearchAgent.tools.graph_search import (
     check_company_disambiguation,
+    find_recent_churn,
     get_coverage_diagnostics,
     search_experts_by_company,
     search_experts_by_function,
@@ -77,6 +79,9 @@ class ConditionalScoutAgent(BaseAgent):
         # Run entity disambiguation when company param is present
         disambiguation = self._run_disambiguation(params)
 
+        # Run temporal search when temporal params are present
+        temporal_results = self._run_temporal_search(params)
+
         if strategy == "graph":
             graph_results = self._run_graph_search(params)
             vector_results = []
@@ -122,6 +127,8 @@ class ConditionalScoutAgent(BaseAgent):
             summary += f" Coverage diagnostics collected for {len(diagnostics)} entities."
         if disambiguation.get("status") == "ambiguous":
             summary += f" Disambiguation: company name is ambiguous ({len(disambiguation.get('matches', []))} matches)."
+        if temporal_results.get("count", 0) > 0:
+            summary += f" Temporal: {temporal_results['count']} recent churn results ({temporal_results.get('churn_type', 'employment')})."
 
         yield self._make_event(
             ctx,
@@ -132,6 +139,7 @@ class ConditionalScoutAgent(BaseAgent):
                 VECTOR_RAW_RESULTS: vector_list,
                 COVERAGE_DIAGNOSTICS: diagnostics,
                 DISAMBIGUATION_RESULT: disambiguation,
+                TEMPORAL_RESULTS: temporal_results,
             },
         )
 
@@ -178,6 +186,41 @@ class ConditionalScoutAgent(BaseAgent):
             return check_company_disambiguation(company_name)
         except Exception as e:
             logger.error("Disambiguation failed: %s", e)
+            return {}
+
+    def _run_temporal_search(self, params: dict) -> dict:
+        """Run temporal churn search when temporal params are present.
+
+        Args:
+            params: Search parameters extracted from routing decision.
+
+        Returns:
+            Temporal results dict from find_recent_churn(), or empty dict
+            when no temporal params or on failure.
+        """
+        temporal_months = params.get("temporal_months")
+        if not temporal_months:
+            return {}
+
+        entity_name = params.get("company") or params.get("product")
+        if not entity_name:
+            return {}
+
+        try:
+            duration = int(temporal_months)
+        except (ValueError, TypeError):
+            duration = 12
+
+        churn_type = params.get("churn_type", "employment")
+
+        try:
+            return find_recent_churn(
+                entity_name=entity_name,
+                duration_months=duration,
+                churn_type=churn_type,
+            )
+        except Exception as e:
+            logger.error("Temporal search failed: %s", e)
             return {}
 
     def _run_graph_search(self, params: dict) -> dict:

@@ -15,6 +15,9 @@ COVERAGE_DIAGNOSTICS = "rag:coverage_diagnostics"   # dict from get_coverage_dia
 # Entity disambiguation (P1.4 — ambiguous company names)
 DISAMBIGUATION_RESULT = "rag:disambiguation_result"  # dict from check_company_disambiguation()
 
+# Temporal search results (P2.3 — recent churn/departures)
+TEMPORAL_RESULTS = "rag:temporal_results"             # dict from find_recent_churn()
+
 # Multi-turn context
 RETRIEVAL_HISTORY = "rag:retrieval_history"         # list[dict] per turn
 SCHEMA_CACHE = "rag:schema_cache"                  # cached schema lookups

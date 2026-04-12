@@ -14,6 +14,7 @@ from VertexRAGSearchAgent.state import (
     DISAMBIGUATION_RESULT,
     GRAPH_RAW_RESULTS,
     ROUTING_DECISION,
+    TEMPORAL_RESULTS,
     VECTOR_RAW_RESULTS,
 )
 
@@ -116,6 +117,51 @@ def _format_disambiguation(disambiguation: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_temporal(temporal: dict) -> str:
+    """Format temporal search results into human-readable text for the LLM.
+
+    Args:
+        temporal: Dict from find_recent_churn() with 'churn_type',
+            'entity_name', 'duration_months', 'cutoff', and 'results' keys.
+
+    Returns:
+        Formatted multi-line string describing the temporal results.
+    """
+    churn_type = temporal.get("churn_type", "employment")
+    entity = temporal.get("entity_name", "unknown")
+    duration = temporal.get("duration_months", 12)
+    results = temporal.get("results", [])
+    cutoff = temporal.get("cutoff", "unknown")
+
+    lines = [
+        f"Temporal search for **'{entity}'** — {churn_type} churn "
+        f"within the last {duration} months (since {cutoff}):",
+        f"Found {len(results)} results.",
+    ]
+
+    for r in results[:10]:
+        if churn_type == "employment":
+            name = r.get("expert_name", "unknown")
+            title = r.get("jobtitle_raw", "")
+            end_y = r.get("end_year", "?")
+            end_m = r.get("end_month")
+            date_str = f"{end_y}-{end_m:02d}" if isinstance(end_m, int) else str(end_y)
+            lines.append(f"- **{name}** — {title}, left ~{date_str}")
+        elif churn_type == "involvement":
+            name = r.get("expert_name", "unknown")
+            product = r.get("product_name", "")
+            end_date = r.get("end_date", "?")
+            lines.append(f"- **{name}** — stopped using {product}, ended {end_date}")
+        elif churn_type == "relationship":
+            from_co = r.get("from_company", "unknown")
+            to_co = r.get("to_company", "unknown")
+            end_date = r.get("end_date", "?")
+            rel = r.get("relation_type", "customer")
+            lines.append(f"- **{from_co}** → {to_co} ({rel}), ended {end_date}")
+
+    return "\n".join(lines)
+
+
 def _build_instruction(ctx: ReadonlyContext) -> str:
     """Build synthesizer instruction with actual search results from state."""
     graph_results = ctx.state.get(GRAPH_RAW_RESULTS, [])
@@ -155,6 +201,17 @@ def _build_instruction(ctx: ReadonlyContext) -> str:
             "Inform the user about the ambiguity and which entity/entities "
             "the search results correspond to. Suggest refining the query "
             "with a more specific company name if needed."
+        )
+
+    # Temporal search results (P2.3) — only present when temporal params detected
+    temporal = ctx.state.get(TEMPORAL_RESULTS, {})
+    if temporal.get("count", 0) > 0:
+        parts.append("\n## Temporal Search Results")
+        parts.append(_format_temporal(temporal))
+        parts.append(
+            "Indicate when each expert left or when the relationship ended. "
+            "Highlight how recently the departure occurred relative to the "
+            "query timeframe."
         )
 
     return "\n".join(parts)

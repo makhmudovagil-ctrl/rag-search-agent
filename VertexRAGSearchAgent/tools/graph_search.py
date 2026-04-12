@@ -8,6 +8,7 @@ Queries two databases:
 
 import os
 import logging
+from datetime import datetime, timedelta
 from typing import Optional
 
 import google.auth
@@ -618,3 +619,266 @@ def check_company_disambiguation(company_name: str) -> dict:
     except Exception as e:
         logger.error("check_company_disambiguation failed: %s", e)
         return {"status": "error", "error": str(e)}
+
+
+# ── Temporal search (P2.3) ────────────────────────────────────────────────────
+
+
+def _parse_end_date(date_str: str) -> Optional[tuple[int, int]]:
+    """Parse end_date STRING(16) into (year, month) tuple.
+
+    Handles formats: "YYYY-MM-DD", "YYYY-MM", "YYYY".
+
+    Args:
+        date_str: Date string from Spanner column.
+
+    Returns:
+        Tuple of (year, month) or None if unparseable.
+    """
+    if not date_str or not isinstance(date_str, str):
+        return None
+    s = date_str.strip()
+    try:
+        if len(s) >= 10:  # "YYYY-MM-DD"
+            return int(s[:4]), int(s[5:7])
+        if len(s) >= 7:   # "YYYY-MM"
+            return int(s[:4]), int(s[5:7])
+        if len(s) >= 4:   # "YYYY"
+            return int(s[:4]), 1
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+def find_recent_churn(
+    entity_name: str,
+    duration_months: int = 12,
+    churn_type: str = "employment",
+    limit: int = _DEFAULT_LIMIT,
+) -> dict:
+    """Find experts or companies with recently ended relationships.
+
+    Programmatic date-math tool that handles temporal queries like
+    "Who left Shell in the last year?" without relying on LLM-generated
+    date queries.
+
+    Args:
+        entity_name: Company or product name (case-insensitive substring match).
+        duration_months: How far back to look (default 12, clamped to [1, 120]).
+        churn_type: Type of churn — "employment" (expert left company),
+            "involvement" (expert stopped using product), or "relationship"
+            (company-to-company customer/supplier ended).
+        limit: Max number of results to return.
+
+    Returns:
+        Dict with query_type="temporal_churn", churn_type, entity_name,
+        duration_months, cutoff, count, and results list.
+    """
+    # Input validation
+    if not entity_name:
+        return {
+            "query_type": "temporal_churn", "churn_type": churn_type,
+            "entity_name": "", "duration_months": 0,
+            "cutoff": "", "count": 0, "results": [],
+        }
+
+    if duration_months < 1:
+        logger.warning("duration_months %d clamped to 1", duration_months)
+        duration_months = 1
+    elif duration_months > 120:
+        logger.warning("duration_months %d clamped to 120", duration_months)
+        duration_months = 120
+
+    valid_types = ("employment", "involvement", "relationship")
+    if churn_type not in valid_types:
+        logger.warning("Unknown churn_type '%s', defaulting to 'employment'", churn_type)
+        churn_type = "employment"
+
+    # Compute cutoff date
+    now = datetime.now()
+    cutoff_date = now - timedelta(days=duration_months * 30)
+    cutoff_year = cutoff_date.year
+    cutoff_month = cutoff_date.month
+    cutoff_str = f"{cutoff_year}-{cutoff_month:02d}"
+
+    base_result = {
+        "query_type": "temporal_churn",
+        "churn_type": churn_type,
+        "entity_name": entity_name,
+        "duration_months": duration_months,
+        "cutoff": cutoff_str,
+    }
+
+    try:
+        if churn_type == "employment":
+            results = _churn_employment(entity_name, cutoff_year, cutoff_month, limit)
+        elif churn_type == "involvement":
+            results = _churn_involvement(entity_name, cutoff_str, limit)
+        else:
+            results = _churn_relationship(entity_name, cutoff_str, limit)
+
+        return {**base_result, "count": len(results), "results": results}
+
+    except Exception as e:
+        logger.error("find_recent_churn failed: %s", e)
+        return {**base_result, "count": 0, "results": [], "error": str(e)}
+
+
+def _churn_employment(
+    company_name: str, cutoff_year: int, cutoff_month: int, limit: int,
+) -> list[dict]:
+    """Query experts who left a company after the cutoff date.
+
+    Uses employment_record.end_year / end_month INT64 columns for reliable
+    date filtering without string parsing.
+    """
+    sql = """
+        GRAPH kg_graph
+        MATCH (e:Expert)-[:HAS_EMPLOYMENT]->(er:EmploymentRecord)-[:AT_COMPANY]->(c:Company)
+        WHERE LOWER(c.company_name) LIKE LOWER(@name)
+          AND er.is_current = false
+          AND er.end_year IS NOT NULL
+          AND (er.end_year > @cutoff_year
+               OR (er.end_year = @cutoff_year AND er.end_month >= @cutoff_month))
+        RETURN DISTINCT
+            e.expert_id, e.expert_name,
+            c.company_name,
+            er.jobtitle_raw, er.position,
+            er.end_year, er.end_month,
+            er.start_year
+        LIMIT @limit
+    """
+    params = {
+        "name": f"%{company_name}%",
+        "cutoff_year": cutoff_year,
+        "cutoff_month": cutoff_month,
+        "limit": limit,
+    }
+    param_types = {
+        "name": spanner.param_types.STRING,
+        "cutoff_year": spanner.param_types.INT64,
+        "cutoff_month": spanner.param_types.INT64,
+        "limit": spanner.param_types.INT64,
+    }
+    return _run_gql(_get_kg_db(), sql, params, param_types)
+
+
+def _churn_involvement(
+    product_name: str, cutoff_str: str, limit: int,
+) -> list[dict]:
+    """Query experts who stopped using a product after the cutoff date.
+
+    Uses edge_involved_with.end_date STRING(16) with lexicographic comparison
+    at SQL level, plus Python-side validation of parsed dates.
+    """
+    sql = """
+        GRAPH kg_graph
+        MATCH (e:Expert)-[:HAS_EMPLOYMENT]->(er:EmploymentRecord)-[iw:INVOLVED_WITH]->(p:Product)
+        WHERE LOWER(p.product_name) LIKE LOWER(@name)
+          AND iw.end_date IS NOT NULL
+          AND iw.end_date >= @cutoff_str
+        RETURN DISTINCT
+            e.expert_id, e.expert_name,
+            p.product_name,
+            iw.supply_chain_position,
+            iw.end_date,
+            er.jobtitle_raw
+        LIMIT @limit
+    """
+    params = {
+        "name": f"%{product_name}%",
+        "cutoff_str": cutoff_str,
+        "limit": limit,
+    }
+    param_types = {
+        "name": spanner.param_types.STRING,
+        "cutoff_str": spanner.param_types.STRING,
+        "limit": spanner.param_types.INT64,
+    }
+    rows = _run_gql(_get_kg_db(), sql, params, param_types)
+
+    # Post-query validation: skip rows with unparseable dates
+    validated = []
+    for row in rows:
+        parsed = _parse_end_date(row.get("end_date", ""))
+        if parsed is None:
+            logger.debug("Skipping row with unparseable end_date: %s", row.get("end_date"))
+            continue
+        validated.append(row)
+    return validated
+
+
+def _churn_relationship(
+    company_name: str, cutoff_str: str, limit: int,
+) -> list[dict]:
+    """Query company-to-company relationships (customer/supplier) that ended.
+
+    Uses plain SQL (not GQL) because edge_customer_of / edge_supplier_of are
+    company-to-company edges not traversed through Expert nodes. Queries both
+    tables and merges results with a relation_type tag.
+    """
+    db = _get_kg_db()
+    params = {
+        "name": f"%{company_name}%",
+        "cutoff_str": cutoff_str,
+        "limit": limit,
+    }
+    param_types = {
+        "name": spanner.param_types.STRING,
+        "cutoff_str": spanner.param_types.STRING,
+        "limit": spanner.param_types.INT64,
+    }
+
+    customer_sql = """
+        SELECT
+            ec.from_company_id, c_from.company_name AS from_company,
+            ec.to_company_id, c_to.company_name AS to_company,
+            ec.end_date, ec.status, 'customer' AS relation_type
+        FROM edge_customer_of ec
+        JOIN company c_from ON ec.from_company_id = c_from.company_id
+        JOIN company c_to ON ec.to_company_id = c_to.company_id
+        WHERE (LOWER(c_from.company_name) LIKE LOWER(@name)
+               OR LOWER(c_to.company_name) LIKE LOWER(@name))
+          AND ec.end_date IS NOT NULL
+          AND ec.end_date >= @cutoff_str
+        LIMIT @limit
+    """
+
+    supplier_sql = """
+        SELECT
+            es.from_company_id, c_from.company_name AS from_company,
+            es.to_company_id, c_to.company_name AS to_company,
+            es.end_date, es.status, 'supplier' AS relation_type
+        FROM edge_supplier_of es
+        JOIN company c_from ON es.from_company_id = c_from.company_id
+        JOIN company c_to ON es.to_company_id = c_to.company_id
+        WHERE (LOWER(c_from.company_name) LIKE LOWER(@name)
+               OR LOWER(c_to.company_name) LIKE LOWER(@name))
+          AND es.end_date IS NOT NULL
+          AND es.end_date >= @cutoff_str
+        LIMIT @limit
+    """
+
+    # Two separate snapshots (Spanner single-use snapshot cannot be reused)
+    with db.snapshot() as snapshot:
+        customer_result = snapshot.execute_sql(customer_sql, params=params, param_types=param_types)
+        customer_rows = list(customer_result)
+        customer_fields = [f.name for f in customer_result.fields]
+
+    with db.snapshot() as snapshot:
+        supplier_result = snapshot.execute_sql(supplier_sql, params=params, param_types=param_types)
+        supplier_rows = list(supplier_result)
+        supplier_fields = [f.name for f in supplier_result.fields]
+
+    results = [dict(zip(customer_fields, r)) for r in customer_rows]
+    results += [dict(zip(supplier_fields, r)) for r in supplier_rows]
+
+    # Post-query validation: skip rows with unparseable dates
+    validated = []
+    for row in results:
+        parsed = _parse_end_date(row.get("end_date", ""))
+        if parsed is None:
+            logger.debug("Skipping row with unparseable end_date: %s", row.get("end_date"))
+            continue
+        validated.append(row)
+    return validated
