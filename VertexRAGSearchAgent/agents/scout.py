@@ -30,6 +30,7 @@ from VertexRAGSearchAgent.state import (
 )
 from VertexRAGSearchAgent.tools.graph_search import (
     check_company_disambiguation,
+    expand_keyword_to_experts,
     find_recent_churn,
     get_coverage_diagnostics,
     search_experts_by_company,
@@ -345,7 +346,32 @@ class ConditionalScoutAgent(BaseAgent):
                 is_current_role=is_current,
             )
         if has_keyword:
-            return search_experts_by_keyword(keyword=params["keyword"])
+            direct = search_experts_by_keyword(keyword=params["keyword"])
+            try:
+                expanded = expand_keyword_to_experts(keyword=params["keyword"])
+            except Exception as e:
+                logger.error("Keyword expansion failed: %s", e)
+                expanded = {"count": 0, "results": []}
+
+            # Merge direct + expanded, dedup by expert_id
+            seen: set[str] = set()
+            merged: list[dict] = []
+            for r in direct.get("results", []):
+                eid = r.get("expert_id", "")
+                if eid and eid not in seen:
+                    seen.add(eid)
+                    merged.append(r)
+            for r in expanded.get("results", []):
+                eid = r.get("expert_id", "")
+                if eid and eid not in seen:
+                    seen.add(eid)
+                    merged.append(r)
+
+            return {
+                "query_type": "keyword_merged",
+                "count": len(merged),
+                "results": merged,
+            }
 
         return {"query_type": "none", "count": 0, "results": [],
                 "error": "No searchable parameters extracted from query"}
