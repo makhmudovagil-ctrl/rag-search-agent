@@ -9,7 +9,12 @@ import json
 
 from google.adk.agents import LlmAgent
 from google.adk.agents.readonly_context import ReadonlyContext
-from VertexRAGSearchAgent.state import GRAPH_RAW_RESULTS, VECTOR_RAW_RESULTS, ROUTING_DECISION
+from VertexRAGSearchAgent.state import (
+    COVERAGE_DIAGNOSTICS,
+    GRAPH_RAW_RESULTS,
+    ROUTING_DECISION,
+    VECTOR_RAW_RESULTS,
+)
 
 _BASE_INSTRUCTION = """You are the synthesis component of an expert discovery pipeline.
 Your job is to take raw search results and produce a clear, ranked list of expert candidates.
@@ -40,6 +45,45 @@ If no results were found, say so clearly and suggest alternative search strategi
 """
 
 
+def _format_diagnostics(diagnostics: dict) -> str:
+    """Format coverage diagnostics dict into human-readable text for the LLM.
+
+    Args:
+        diagnostics: Dict from get_coverage_diagnostics() with 'product'
+            and/or 'company' keys.
+
+    Returns:
+        Formatted multi-line string describing each entity's status.
+    """
+    lines = []
+    for entity_type in ("product", "company"):
+        info = diagnostics.get(entity_type)
+        if not info:
+            continue
+
+        name = info.get("name", "unknown")
+        status = info.get("status", "unknown")
+
+        if status == "not_found":
+            lines.append(f"- **{entity_type.title()} '{name}'**: Not found in the database.")
+        elif status == "found":
+            matches = info.get("matches", [])
+            for match in matches:
+                match_name = match.get("name", name)
+                expert_count = match.get("expert_count")
+                artifact_count = match.get("artifact_count")
+                count_label = (
+                    f"{expert_count} linked experts"
+                    if expert_count is not None
+                    else f"{artifact_count} knowledge artifacts"
+                    if artifact_count is not None
+                    else "unknown coverage"
+                )
+                lines.append(f"- **{entity_type.title()} '{match_name}'**: Found — {count_label}.")
+
+    return "\n".join(lines) if lines else "No diagnosable entities."
+
+
 def _build_instruction(ctx: ReadonlyContext) -> str:
     """Build synthesizer instruction with actual search results from state."""
     graph_results = ctx.state.get(GRAPH_RAW_RESULTS, [])
@@ -59,6 +103,16 @@ def _build_instruction(ctx: ReadonlyContext) -> str:
         parts.append(f"\n## Vector Search Results ({len(vector_results)} experts)\n```json\n{json.dumps(vector_results, default=str, indent=2)}\n```")
     else:
         parts.append("\n## Vector Search Results\nNo results found.")
+
+    # Coverage diagnostics (P1.3) — only present when results are sparse
+    diagnostics = ctx.state.get(COVERAGE_DIAGNOSTICS, {})
+    if diagnostics:
+        parts.append("\n## Coverage Diagnostics")
+        parts.append(_format_diagnostics(diagnostics))
+        parts.append(
+            "Use the diagnostics above to explain to the user why results are "
+            "sparse and suggest alternative search strategies."
+        )
 
     return "\n".join(parts)
 

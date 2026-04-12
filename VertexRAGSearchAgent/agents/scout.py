@@ -19,12 +19,14 @@ from google.adk.events import Event, EventActions
 from google.genai.types import Content, Part
 
 from VertexRAGSearchAgent.state import (
+    COVERAGE_DIAGNOSTICS,
     GRAPH_RAW_RESULTS,
     ROUTING_DECISION,
     ROUTING_STRATEGY,
     VECTOR_RAW_RESULTS,
 )
 from VertexRAGSearchAgent.tools.graph_search import (
+    get_coverage_diagnostics,
     search_experts_by_company,
     search_experts_by_function,
     search_experts_by_industry,
@@ -99,6 +101,11 @@ class ConditionalScoutAgent(BaseAgent):
         vector_list = vector_results.get("results", []) if isinstance(vector_results, dict) else []
         total = len(graph_list) + len(vector_list)
 
+        # Run coverage diagnostics when results are sparse
+        diagnostics = {}
+        if total < RESULT_THRESHOLD:
+            diagnostics = self._run_diagnostics(params)
+
         summary = (
             f"Search complete. Strategy: {strategy}. "
             f"Graph: {len(graph_list)} results. Vector: {len(vector_list)} results. "
@@ -106,6 +113,8 @@ class ConditionalScoutAgent(BaseAgent):
         )
         if graph_results.get("error"):
             summary += f" Graph error: {graph_results['error']}"
+        if diagnostics:
+            summary += f" Coverage diagnostics collected for {len(diagnostics)} entities."
 
         yield self._make_event(
             ctx,
@@ -114,8 +123,34 @@ class ConditionalScoutAgent(BaseAgent):
                 ROUTING_STRATEGY: strategy,
                 GRAPH_RAW_RESULTS: graph_list,
                 VECTOR_RAW_RESULTS: vector_list,
+                COVERAGE_DIAGNOSTICS: diagnostics,
             },
         )
+
+    def _run_diagnostics(self, params: dict) -> dict:
+        """Run coverage diagnostics for sparse results.
+
+        Args:
+            params: Search parameters extracted from routing decision.
+
+        Returns:
+            Diagnostics dict from get_coverage_diagnostics(), or empty dict on
+            failure or when no diagnosable entities are present.
+        """
+        product_name = params.get("product")
+        company_name = params.get("company")
+
+        if not product_name and not company_name:
+            return {}
+
+        try:
+            return get_coverage_diagnostics(
+                product_name=product_name,
+                company_name=company_name,
+            )
+        except Exception as e:
+            logger.error("Coverage diagnostics failed: %s", e)
+            return {}
 
     def _run_graph_search(self, params: dict) -> dict:
         """Dispatch to the appropriate graph search function based on params."""
