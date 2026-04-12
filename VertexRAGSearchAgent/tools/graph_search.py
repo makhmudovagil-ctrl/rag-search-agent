@@ -532,3 +532,89 @@ def get_coverage_diagnostics(
             }
 
     return diagnostics
+
+
+def check_company_disambiguation(company_name: str) -> dict:
+    """Check if a company name is ambiguous and return aliases.
+
+    Queries the company table for matches, checks ambiguity_flag, and fetches
+    any known aliases from company_alias. Used by Scout to surface
+    disambiguation notices when company names are ambiguous.
+
+    Args:
+        company_name: Company name to check (case-insensitive substring match).
+
+    Returns:
+        Dict with 'status' key:
+        - "not_found": no matching company in database
+        - "unambiguous": exactly one match, not flagged
+        - "ambiguous": multiple matches or ambiguity_flag is true
+        - "error": query failed
+    """
+    try:
+        db = _get_kg_db()
+
+        # Query 1: find matching companies
+        with db.snapshot() as snapshot:
+            company_rows = list(snapshot.execute_sql(
+                "SELECT company_id, company_name, expert_count, ambiguity_flag "
+                "FROM company "
+                "WHERE LOWER(company_name) LIKE LOWER(@name) LIMIT 10",
+                params={"name": f"%{company_name}%"},
+                param_types={"name": spanner.param_types.STRING},
+            ))
+
+        if not company_rows:
+            return {"status": "not_found", "name": company_name}
+
+        matches = [
+            {
+                "company_id": r[0],
+                "company_name": r[1],
+                "expert_count": r[2],
+                "ambiguity_flag": r[3],
+            }
+            for r in company_rows
+        ]
+
+        # Query 2: fetch aliases for ALL matched company_ids
+        company_ids = [r[0] for r in company_rows]
+        aliases = []
+        with db.snapshot() as snapshot:
+            alias_rows = list(snapshot.execute_sql(
+                "SELECT alias_id, alias_name, alias_type, company_id "
+                "FROM company_alias "
+                "WHERE company_id IN UNNEST(@ids)",
+                params={"ids": company_ids},
+                param_types={"ids": spanner.param_types.Array(spanner.param_types.STRING)},
+            ))
+        aliases = [
+            {
+                "alias_name": r[1],
+                "alias_type": r[2],
+                "company_id": r[3],
+            }
+            for r in alias_rows
+        ]
+
+        # Determine ambiguity: flagged OR multiple distinct matches
+        any_flagged = any(m.get("ambiguity_flag") for m in matches)
+        is_ambiguous = any_flagged or len(matches) > 1
+
+        if is_ambiguous:
+            return {
+                "status": "ambiguous",
+                "name": company_name,
+                "matches": matches,
+                "aliases": aliases,
+            }
+
+        # Single unambiguous match
+        result = {"status": "unambiguous", "company": matches[0]}
+        if aliases:
+            result["aliases"] = aliases
+        return result
+
+    except Exception as e:
+        logger.error("check_company_disambiguation failed: %s", e)
+        return {"status": "error", "error": str(e)}

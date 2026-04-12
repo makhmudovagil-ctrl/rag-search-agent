@@ -12,6 +12,9 @@ VECTOR_RAW_RESULTS = "rag:vector_raw_results"      # list[dict]
 # Coverage diagnostics (P1.3 — sparse result explainer)
 COVERAGE_DIAGNOSTICS = "rag:coverage_diagnostics"   # dict from get_coverage_diagnostics()
 
+# Entity disambiguation (P1.4 — ambiguous company names)
+DISAMBIGUATION_RESULT = "rag:disambiguation_result"  # dict from check_company_disambiguation()
+
 # Multi-turn context
 RETRIEVAL_HISTORY = "rag:retrieval_history"         # list[dict] per turn
 SCHEMA_CACHE = "rag:schema_cache"                  # cached schema lookups

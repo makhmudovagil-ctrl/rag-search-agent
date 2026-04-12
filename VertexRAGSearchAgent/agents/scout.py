@@ -20,12 +20,14 @@ from google.genai.types import Content, Part
 
 from VertexRAGSearchAgent.state import (
     COVERAGE_DIAGNOSTICS,
+    DISAMBIGUATION_RESULT,
     GRAPH_RAW_RESULTS,
     ROUTING_DECISION,
     ROUTING_STRATEGY,
     VECTOR_RAW_RESULTS,
 )
 from VertexRAGSearchAgent.tools.graph_search import (
+    check_company_disambiguation,
     get_coverage_diagnostics,
     search_experts_by_company,
     search_experts_by_function,
@@ -72,6 +74,9 @@ class ConditionalScoutAgent(BaseAgent):
             else:
                 params[sp.param_type] = sp.value
 
+        # Run entity disambiguation when company param is present
+        disambiguation = self._run_disambiguation(params)
+
         if strategy == "graph":
             graph_results = self._run_graph_search(params)
             vector_results = []
@@ -115,6 +120,8 @@ class ConditionalScoutAgent(BaseAgent):
             summary += f" Graph error: {graph_results['error']}"
         if diagnostics:
             summary += f" Coverage diagnostics collected for {len(diagnostics)} entities."
+        if disambiguation.get("status") == "ambiguous":
+            summary += f" Disambiguation: company name is ambiguous ({len(disambiguation.get('matches', []))} matches)."
 
         yield self._make_event(
             ctx,
@@ -124,6 +131,7 @@ class ConditionalScoutAgent(BaseAgent):
                 GRAPH_RAW_RESULTS: graph_list,
                 VECTOR_RAW_RESULTS: vector_list,
                 COVERAGE_DIAGNOSTICS: diagnostics,
+                DISAMBIGUATION_RESULT: disambiguation,
             },
         )
 
@@ -150,6 +158,26 @@ class ConditionalScoutAgent(BaseAgent):
             )
         except Exception as e:
             logger.error("Coverage diagnostics failed: %s", e)
+            return {}
+
+    def _run_disambiguation(self, params: dict) -> dict:
+        """Run entity disambiguation for company parameter.
+
+        Args:
+            params: Search parameters extracted from routing decision.
+
+        Returns:
+            Disambiguation dict from check_company_disambiguation(), or empty
+            dict when no company param or on failure.
+        """
+        company_name = params.get("company")
+        if not company_name:
+            return {}
+
+        try:
+            return check_company_disambiguation(company_name)
+        except Exception as e:
+            logger.error("Disambiguation failed: %s", e)
             return {}
 
     def _run_graph_search(self, params: dict) -> dict:

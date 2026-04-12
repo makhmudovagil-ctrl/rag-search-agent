@@ -11,6 +11,7 @@ from google.adk.agents import LlmAgent
 from google.adk.agents.readonly_context import ReadonlyContext
 from VertexRAGSearchAgent.state import (
     COVERAGE_DIAGNOSTICS,
+    DISAMBIGUATION_RESULT,
     GRAPH_RAW_RESULTS,
     ROUTING_DECISION,
     VECTOR_RAW_RESULTS,
@@ -84,6 +85,37 @@ def _format_diagnostics(diagnostics: dict) -> str:
     return "\n".join(lines) if lines else "No diagnosable entities."
 
 
+def _format_disambiguation(disambiguation: dict) -> str:
+    """Format disambiguation data into human-readable text for the LLM.
+
+    Args:
+        disambiguation: Dict from check_company_disambiguation() with
+            'status', 'matches', and 'aliases' keys.
+
+    Returns:
+        Formatted multi-line string describing the ambiguity.
+    """
+    name = disambiguation.get("name", "unknown")
+    matches = disambiguation.get("matches", [])
+    aliases = disambiguation.get("aliases", [])
+
+    lines = [f"The company name **'{name}'** is ambiguous. Multiple entities match:"]
+
+    for match in matches:
+        company_name = match.get("company_name", "unknown")
+        expert_count = match.get("expert_count", 0)
+        company_id = match.get("company_id", "")
+        flag = " (flagged)" if match.get("ambiguity_flag") else ""
+        lines.append(f"- **{company_name}** — {expert_count} linked experts{flag}")
+
+        # List aliases for this specific company
+        company_aliases = [a for a in aliases if a.get("company_id") == company_id]
+        for alias in company_aliases:
+            lines.append(f"  - Also known as: {alias['alias_name']} ({alias.get('alias_type', 'alias')})")
+
+    return "\n".join(lines)
+
+
 def _build_instruction(ctx: ReadonlyContext) -> str:
     """Build synthesizer instruction with actual search results from state."""
     graph_results = ctx.state.get(GRAPH_RAW_RESULTS, [])
@@ -112,6 +144,17 @@ def _build_instruction(ctx: ReadonlyContext) -> str:
         parts.append(
             "Use the diagnostics above to explain to the user why results are "
             "sparse and suggest alternative search strategies."
+        )
+
+    # Entity disambiguation (P1.4) — only present when company name is ambiguous
+    disambiguation = ctx.state.get(DISAMBIGUATION_RESULT, {})
+    if disambiguation.get("status") == "ambiguous":
+        parts.append("\n## Disambiguation Notice")
+        parts.append(_format_disambiguation(disambiguation))
+        parts.append(
+            "Inform the user about the ambiguity and which entity/entities "
+            "the search results correspond to. Suggest refining the query "
+            "with a more specific company name if needed."
         )
 
     return "\n".join(parts)
