@@ -11,6 +11,7 @@ from google.adk.agents import LlmAgent
 from google.adk.agents.readonly_context import ReadonlyContext
 from VertexRAGSearchAgent.state import (
     COVERAGE_DIAGNOSTICS,
+    COVERAGE_ESTIMATE,
     DISAMBIGUATION_RESULT,
     GRAPH_RAW_RESULTS,
     ROUTING_DECISION,
@@ -162,6 +163,29 @@ def _format_temporal(temporal: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_coverage_estimate(estimate: dict) -> str:
+    """Format coverage estimate dict into concise per-entity lines.
+
+    Args:
+        estimate: Dict with 'company' and/or 'product' sub-dicts,
+            each containing 'actual', 'estimated', 'fraction', 'label'.
+
+    Returns:
+        Formatted multi-line string, one line per entity.
+    """
+    lines = []
+    for entity_type, info in estimate.items():
+        actual = info.get("actual", 0)
+        estimated = info.get("estimated", 0)
+        label = info.get("label", "Unknown")
+        unit = "experts" if entity_type == "company" else "artifacts"
+        lines.append(
+            f"- {entity_type.title()}: Found {actual} of ~{estimated} "
+            f"estimated {unit} ({label})."
+        )
+    return "\n".join(lines)
+
+
 def _build_instruction(ctx: ReadonlyContext) -> str:
     """Build synthesizer instruction with actual search results from state."""
     graph_results = ctx.state.get(GRAPH_RAW_RESULTS, [])
@@ -190,6 +214,16 @@ def _build_instruction(ctx: ReadonlyContext) -> str:
         parts.append(
             "Use the diagnostics above to explain to the user why results are "
             "sparse and suggest alternative search strategies."
+        )
+
+    # Coverage estimate (P2.4) — present when entity counts are available
+    coverage_estimate = ctx.state.get(COVERAGE_ESTIMATE, {})
+    if coverage_estimate:
+        parts.append("\n## Coverage Estimate")
+        parts.append(_format_coverage_estimate(coverage_estimate))
+        parts.append(
+            "Use the coverage estimate to inform the user how comprehensive "
+            "the results are. If coverage is low, suggest broadening the search."
         )
 
     # Entity disambiguation (P1.4) — only present when company name is ambiguous

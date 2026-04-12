@@ -12,6 +12,9 @@ VECTOR_RAW_RESULTS = "rag:vector_raw_results"      # list[dict]
 # Coverage diagnostics (P1.3 — sparse result explainer)
 COVERAGE_DIAGNOSTICS = "rag:coverage_diagnostics"   # dict from get_coverage_diagnostics()
 
+# Coverage estimation (P2.4 — "Found X of ~Y experts")
+COVERAGE_ESTIMATE = "rag:coverage_estimate"          # dict from compute_coverage_estimate()
+
 # Entity disambiguation (P1.4 — ambiguous company names)
 DISAMBIGUATION_RESULT = "rag:disambiguation_result"  # dict from check_company_disambiguation()
 

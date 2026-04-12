@@ -20,6 +20,7 @@ from google.genai.types import Content, Part
 
 from VertexRAGSearchAgent.state import (
     COVERAGE_DIAGNOSTICS,
+    COVERAGE_ESTIMATE,
     DISAMBIGUATION_RESULT,
     GRAPH_RAW_RESULTS,
     ROUTING_DECISION,
@@ -43,6 +44,71 @@ from VertexRAGSearchAgent.tools.vector_search import search_experts_by_vector
 logger = logging.getLogger(__name__)
 
 RESULT_THRESHOLD = 3
+
+# ── Coverage Estimation (P2.4) ──────────────────────────────
+
+_HIGH_THRESHOLD = 0.8
+_MODERATE_THRESHOLD = 0.4
+
+
+def compute_coverage_estimate(actual_count: int, diagnostics: dict) -> dict:
+    """Compute coverage fraction from actual results vs estimated pool.
+
+    Pure function — no I/O. Uses pre-computed expert_count / artifact_count
+    from the diagnostics dict (produced by get_coverage_diagnostics).
+
+    Args:
+        actual_count: Number of unique experts returned by search.
+        diagnostics: Dict from get_coverage_diagnostics() with 'product'
+            and/or 'company' keys, each having 'matches' with counts.
+
+    Returns:
+        Dict with per-entity estimates, e.g.:
+        {"company": {"actual": 3, "estimated": 12, "fraction": 0.25, "label": "Low coverage"}}
+        Empty dict if no estimates are computable.
+    """
+    estimate = {}
+
+    company_info = diagnostics.get("company")
+    if company_info and company_info.get("status") == "found":
+        total = sum(
+            m.get("expert_count") or 0 for m in company_info.get("matches", [])
+        )
+        # Skip when estimated total is 0 or actual already exceeds estimate
+        # (estimate is not informative if we found more than the DB thinks exist)
+        if total > 0 and actual_count < total:
+            fraction = actual_count / total
+            estimate["company"] = {
+                "actual": actual_count,
+                "estimated": total,
+                "fraction": fraction,
+                "label": _coverage_label(fraction),
+            }
+
+    product_info = diagnostics.get("product")
+    if product_info and product_info.get("status") == "found":
+        total = sum(
+            m.get("artifact_count") or 0 for m in product_info.get("matches", [])
+        )
+        if total > 0 and actual_count < total:
+            fraction = actual_count / total
+            estimate["product"] = {
+                "actual": actual_count,
+                "estimated": total,
+                "fraction": fraction,
+                "label": _coverage_label(fraction),
+            }
+
+    return estimate
+
+
+def _coverage_label(fraction: float) -> str:
+    """Return a qualitative label for a coverage fraction."""
+    if fraction >= _HIGH_THRESHOLD:
+        return "High coverage"
+    if fraction >= _MODERATE_THRESHOLD:
+        return "Moderate coverage"
+    return "Low coverage"
 
 
 class ConditionalScoutAgent(BaseAgent):
@@ -111,10 +177,11 @@ class ConditionalScoutAgent(BaseAgent):
         vector_list = vector_results.get("results", []) if isinstance(vector_results, dict) else []
         total = len(graph_list) + len(vector_list)
 
-        # Run coverage diagnostics when results are sparse
-        diagnostics = {}
-        if total < RESULT_THRESHOLD:
-            diagnostics = self._run_diagnostics(params)
+        # Always run coverage diagnostics when entity params exist (P2.4)
+        diagnostics = self._run_diagnostics(params)
+
+        # Compute coverage estimate (P2.4)
+        coverage_estimate = compute_coverage_estimate(total, diagnostics)
 
         summary = (
             f"Search complete. Strategy: {strategy}. "
@@ -125,6 +192,9 @@ class ConditionalScoutAgent(BaseAgent):
             summary += f" Graph error: {graph_results['error']}"
         if diagnostics:
             summary += f" Coverage diagnostics collected for {len(diagnostics)} entities."
+        if coverage_estimate:
+            for etype, est in coverage_estimate.items():
+                summary += f" {etype.title()}: {est['actual']}/{est['estimated']} ({est['label']})."
         if disambiguation.get("status") == "ambiguous":
             summary += f" Disambiguation: company name is ambiguous ({len(disambiguation.get('matches', []))} matches)."
         if temporal_results.get("count", 0) > 0:
@@ -138,6 +208,7 @@ class ConditionalScoutAgent(BaseAgent):
                 GRAPH_RAW_RESULTS: graph_list,
                 VECTOR_RAW_RESULTS: vector_list,
                 COVERAGE_DIAGNOSTICS: diagnostics,
+                COVERAGE_ESTIMATE: coverage_estimate,
                 DISAMBIGUATION_RESULT: disambiguation,
                 TEMPORAL_RESULTS: temporal_results,
             },
