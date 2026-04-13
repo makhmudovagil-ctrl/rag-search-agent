@@ -1,67 +1,134 @@
 # Vertex RAG Search Agent
 
-The **Vertex RAG Search Agent** is a sophisticated expert discovery pipeline designed to traverse complex professional networks. It uses a hybrid retrieval strategy combining **Spanner Property Graph (GQL)** for structural queries and **Vertex AI Vector Search** for semantic discovery.
+An expert discovery pipeline that finds domain experts across professional networks using a hybrid retrieval strategy combining **Spanner Property Graph (GQL)** for structural queries and **Vertex AI Vector Search** for semantic discovery. Built with Google ADK, deployed to Vertex AI Agent Engine.
 
-## Architecture Overview
+## Architecture
 
-The agent follows a modular "Router-Scout-Synthesizer" pattern, where intent classification happens before any data retrieval.
+The agent follows a **Router → Scout → Re-ranker → Synthesizer** pipeline. Only the Synthesizer's final answer is visible to the user.
 
 ```mermaid
 graph TD
-    UserQuery((User Query)) --> Router[Intent Classifier / Router]
-    
-    subgraph "Scout (Orchestration Layer)"
-        Router -- "Strategy: Graph" --> GraphSearch[Spanner GQL Search]
-        Router -- "Strategy: Vector" --> VectorSearch[Vertex AI Vector Search]
-        Router -- "Strategy: Hybrid" --> HybridSearch[Parallel Graph + Vector]
-        
-        GraphSearch -- "Sparse Results (<3)" --> Fallback[Vector Fallback]
+    Q((User Query)) --> Router
+
+    subgraph "Step 1: Intent Classification"
+        Router["Router — Gemini structured output<br/>(strategy + search params)"]
+        Router -->|graph| GS
+        Router -->|vector| VS
+        Router -->|hybrid| GS & VS
+        Router -->|temporal| TS
     end
-    
-    GraphSearch --> Merger[Result Merger & De-duplicator]
-    VectorSearch --> Merger
-    Fallback --> Merger
-    
-    Merger --> Synthesizer[Synthesizer / Re-ranker]
-    Synthesizer --> FinalAnswer((Final Answer))
+
+    subgraph "Step 2: Retrieval — ConditionalScoutAgent"
+        GS["Graph Search<br/>9 GQL functions"]
+        VS["Vector Search<br/>COSINE_DISTANCE over 2 corpora"]
+        TS["Temporal Search<br/>churn detection"]
+        KW["Keyword Expansion<br/>keyword → product / industry / function"]
+
+        GS -->|"< 3 results"| VS
+        GS --> Disambig["Entity Disambiguation<br/>ambiguity check + aliases"]
+        GS -->|"< 3 results"| Diag["Coverage Diagnostics<br/>sparse result explainer"]
+        KW -.->|discovered entities| GS
+    end
+
+    subgraph "Step 2.5: Re-ranking"
+        GS & VS & TS --> Reranker["Re-ranker — Gemini<br/>scores 0–1 by relevance,<br/>recency, seniority, supply chain"]
+    end
+
+    subgraph "Step 3: Synthesis"
+        Reranker --> Synth["Synthesizer — Gemini<br/>dedup, format, coverage estimate"]
+        Disambig -.-> Synth
+        Diag -.-> Synth
+    end
+
+    Synth --> A((Final Answer))
 ```
 
 ## Key Components
 
-### 1. Intent-Based Router (`agents/router.py`)
-A Gemini-powered classifier that analyzes the query to determine the optimal retrieval path.
-- **Graph Path**: Chosen for queries with specific entities (companies, products) or structural constraints (seniority, supply chain roles).
-- **Vector Path**: Chosen for semantic or behavioral language ("experienced in navigating transitions").
-- **Hybrid Path**: Chosen when a query combines both structural anchors and semantic qualifiers.
-- **Parameter Extraction**: Automatically extracts structured filters (Product, Company, Industry, Function, Seniority, Supply Chain Position) for GQL traversal.
+### 1. Router (`agents/router.py`)
 
-### 2. Conditional Scout (`agents/scout.py`)
-The execution engine that implements the retrieval logic:
-- **Hybrid Execution**: Runs Graph and Vector searches in parallel for "hybrid" intents.
-- **Automatic Fallback**: If a "Graph" search returns fewer than 3 results, the Scout automatically triggers a Vector search to ensure coverage.
-- **Multi-hop Traversal**: Dispatches to specialized tools capable of traversing 3-4 hops across the knowledge graph (Expert → Employment → Company → Industry).
+Gemini-powered intent classifier with structured output (`RoutingDecision` schema). Determines the optimal retrieval strategy before any data is fetched.
 
-### 3. Synthesizer (`agents/synthesizer.py`)
-The final stage that transforms raw data into a professional response:
-- **De-duplication**: Groups multiple employment records by expert.
-- **Re-ranking**: Prioritizes current roles, direct involvement, and higher seniority.
-- **Evidence-based Synthesis**: Provides specific reasons why each expert matches the query based on the retrieved graph/vector metadata.
+- **Strategy selection**: `graph`, `vector`, or `hybrid` based on query signals
+- **Parameter extraction**: Product, Company, Industry, Function, Seniority, Supply Chain Position
+- **Temporal detection**: Recognizes time-based signals ("who left in the last year") and routes to temporal search
+- **Auto-upgrade**: Promotes `vector` → `hybrid` when keyword parameters are present
+
+### 2. ConditionalScoutAgent (`agents/scout.py`)
+
+Deterministic `BaseAgent` (no LLM) that reads the routing decision from session state and dispatches search tools:
+
+- **Graph path** → runs graph search → if results < 3 → automatic vector fallback
+- **Vector path** → runs vector search only
+- **Hybrid path** → runs graph + vector in parallel
+- **Temporal path** → runs churn detection (employment, involvement, relationship)
+- **Disambiguation** → checks ambiguous company names, surfaces aliases
+- **Coverage diagnostics** → explains why results are sparse ("Company found, but no linked experts")
+
+### 3. Re-ranker (`agents/reranker.py`)
+
+Gemini contextual re-ranking step between Scout and Synthesizer. Merges results from all sources, deduplicates by expert, and scores each expert 0–1 on:
+
+- Query relevance
+- Recency (current vs. former roles)
+- Seniority level
+- Supply chain position match
+
+### 4. Synthesizer (`agents/synthesizer.py`)
+
+Final Gemini call that produces the user-facing answer. Reads re-ranked results from session state and generates a structured response with:
+
+- Expert profiles with evidence-based relevance explanations
+- Disambiguation notices (when company names are ambiguous)
+- Coverage estimate ("Found X of ~Y estimated experts")
+- Diagnostic notes (when results are sparse)
 
 ## Retrieval Strategies
 
-### Structural Search (Graph)
-Leverages **Spanner Property Graph** to perform precise traversals. Supported paths include:
-- `Expert → EmploymentRecord → [INVOLVED_WITH] → Product`
-- `Expert → EmploymentRecord → [AT_COMPANY] → Company → [IN_INDUSTRY] → Industry`
-- `Keyword → KnowledgeArtifact → EmploymentRecord → Expert`
+### Structural Search — Graph (`tools/graph_search.py`)
 
-### Semantic Search (Vector)
-Performs similarity matching over knowledge artifacts.
-- **Current Status**: MVP uses keyword-based fallback.
-- **Roadmap**: Full integration with Vertex AI Vector Search (Index) and `text-embedding-005` for deep semantic retrieval.
+9 GQL functions over Spanner Property Graph:
+
+| Function | Traversal Path | Use Case |
+|----------|---------------|----------|
+| `search_experts_by_product` | Expert → Employment → Product | "Who works with SAP ERP?" |
+| `search_experts_by_company` | Expert → Employment → Company | "Experts at Shell" |
+| `search_experts_by_industry` | Expert → Employment → Company → Industry | "Oil & gas experts" |
+| `search_experts_by_function` | Expert → Employment → Role | "VP-level finance people" |
+| `search_experts_by_keyword` | Keyword → Artifact → Employment → Expert | "SCADA specialists" |
+| `expand_keyword_to_experts` | Keyword → Product/Industry/Function → Expert | Keyword expansion |
+| `search_experts_multi_hop` | Combined product + company + industry + function | Complex queries |
+| `get_expert_profile` | Full employment history for one expert | Profile lookup |
+| `get_coverage_diagnostics` | Entity existence + expert/artifact counts | Sparse result analysis |
+
+Additional tools: `find_recent_churn()` (temporal search), `check_company_disambiguation()` (entity disambiguation).
+
+### Semantic Search — Vector (`tools/vector_search.py`)
+
+Vertex AI `text-embedding-005` (768 dimensions) with `COSINE_DISTANCE` in Spanner. Two embedding corpora searched via UNION ALL:
+
+| Corpus | Source | Use Case |
+|--------|--------|----------|
+| `knowledge_artifact.text_embedding` | Published articles, papers, analyses | Domain expertise signals |
+| `employment_record.responsibilities_embedding` | Job responsibility descriptions | Duty-oriented queries ("managed P&L", "oversaw operations") |
+
+Results are deduplicated by expert in Python (over-fetch `limit × 10`) and tagged with `match_source` for evidence attribution.
 
 ## Technical Stack
-- **Framework**: Google ADK (Agent Development Kit)
-- **Model**: `gemini-2.0-flash`
-- **Database**: Google Cloud Spanner (Property Graph / GQL)
-- **Embeddings**: Vertex AI Vector Search (Planned)
+
+| Component | Technology |
+|-----------|-----------|
+| Framework | Google ADK (Agent Development Kit) |
+| LLM | Gemini 2.0 Flash |
+| Database | Google Cloud Spanner — Property Graph + GQL |
+| Embeddings | Vertex AI `text-embedding-005` (768 dims) |
+| Validation | Pydantic >= 2.7 |
+| Deployment | Vertex AI Agent Engine |
+
+## Status
+
+| Phase | Features | Status |
+|-------|----------|--------|
+| **Phase 1** | Vector search, sparse result explainer, entity disambiguator, embedding generation | ✅ Complete |
+| **Phase 2** | Re-ranker, keyword expansion, temporal tool, coverage estimation | ✅ Complete |
+| **Phase 3** | Multi-turn sessions, query decomposition, schema lookup, A2A integration | Planned |
