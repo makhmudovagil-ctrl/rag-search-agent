@@ -2,7 +2,7 @@
 Graph Search Tool — structural expert search via Spanner Property Graph (GQL).
 
 Queries two databases:
-  - kg_products_v4_dev  → kg_graph      (products, industries, companies, roles)
+  - kg_products_v5_dev  → kg_graph      (products, industries, companies, roles)
   - kg_v2_3_dev         → ExpertNetworkV2 (qualifications, screening history)
 """
 
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # ── Connection config ──────────────────────────────────────────────────────────
 _PROJECT = os.getenv("GCP_PROJECT_ID", "gcp-poc-488614")
 _INSTANCE = os.getenv("SPANNER_INSTANCE_ID", "kg-dev-instance")
-_KG_DB = os.getenv("SPANNER_DATABASE_ID", "kg_products_v4_dev")
+_KG_DB = os.getenv("SPANNER_DATABASE_ID", "kg_products_v5_dev")
 _OPS_DB = os.getenv("SPANNER_OPS_DATABASE_ID", "kg_v2_3_dev")
 _DEFAULT_LIMIT = 20
 
@@ -104,7 +104,7 @@ def search_experts_by_product(
         WHERE {filters}
         RETURN DISTINCT
             e.expert_id,
-            e.expert_name,
+            e.name,
             p.product_name,
             iw.supply_chain_position,
             er.jobtitle_raw,
@@ -141,14 +141,14 @@ def search_experts_by_company(
         is_current_role: Filter by current/past employment.
         limit: Max results.
     """
-    filters = "LOWER(c.company_name) LIKE LOWER(@company_name)"
+    filters = "LOWER(c.name_raw) LIKE LOWER(@company_name)"
     params: dict = {"company_name": f"%{company_name}%"}
     param_types = {"company_name": spanner.param_types.STRING}
 
-    # HAS_ROLE and AT_COMPANY both originate from EmploymentRecord — use comma to split paths
+    # IN_ROLE and AT_COMPANY both originate from EmploymentRecord — use comma to split paths
     extra_match = ""
     if function:
-        extra_match = ",\n              (er)-[:HAS_ROLE]->(r:Role)"
+        extra_match = ",\n              (er)-[:IN_ROLE]->(r:Role)"
         filters += " AND r.function = @function"
         params["function"] = function
         param_types["function"] = spanner.param_types.STRING
@@ -158,7 +158,7 @@ def search_experts_by_company(
         params["is_current"] = is_current_role
         param_types["is_current"] = spanner.param_types.BOOL
 
-    return_cols = "e.expert_id, e.expert_name, c.company_name, er.jobtitle_raw, er.is_current, er.start_year, er.end_year"
+    return_cols = "e.expert_id, e.name, c.name_raw, er.jobtitle_raw, er.is_current, er.start_year, er.end_year"
     if function:
         return_cols += ", r.function, r.seniority"
 
@@ -202,7 +202,7 @@ def search_experts_by_industry(
 
     extra_match = ""
     if function:
-        extra_match = ",\n              (er)-[:HAS_ROLE]->(r:Role)"
+        extra_match = ",\n              (er)-[:IN_ROLE]->(r:Role)"
         filters += " AND r.function = @function"
         params["function"] = function
         param_types["function"] = spanner.param_types.STRING
@@ -212,7 +212,7 @@ def search_experts_by_industry(
         params["is_current"] = is_current_role
         param_types["is_current"] = spanner.param_types.BOOL
 
-    return_cols = "e.expert_id, e.expert_name, c.company_name, i.name AS industry_name, er.jobtitle_raw, er.is_current"
+    return_cols = "e.expert_id, e.name, c.name_raw, i.name AS industry_name, er.jobtitle_raw, er.is_current"
     if function:
         return_cols += ", r.function, r.seniority"
 
@@ -243,7 +243,7 @@ def search_experts_by_function(
 ) -> dict:
     """Search experts by their role function (department/area).
 
-    Traversal path: Expert → EmploymentRecord → [HAS_ROLE] → Role
+    Traversal path: Expert → EmploymentRecord → [IN_ROLE] → Role
 
     Args:
         function: Role function — one of: Operations, Commercial, Strategy, Finance,
@@ -274,13 +274,13 @@ def search_experts_by_function(
         params["industry_name"] = f"%{industry_name}%"
         param_types["industry_name"] = spanner.param_types.STRING
 
-    return_cols = "e.expert_id, e.expert_name, r.function, r.seniority, er.jobtitle_raw, er.is_current"
+    return_cols = "e.expert_id, e.name, r.function, r.seniority, er.jobtitle_raw, er.is_current"
     if industry_name:
-        return_cols += ", c.company_name, i.name AS industry_name"
+        return_cols += ", c.name_raw, i.name AS industry_name"
 
     sql = f"""
         GRAPH kg_graph
-        MATCH (e:Expert)-[:HAS_EMPLOYMENT]->(er:EmploymentRecord)-[:HAS_ROLE]->(r:Role){industry_join}
+        MATCH (e:Expert)-[:HAS_EMPLOYMENT]->(er:EmploymentRecord)-[:IN_ROLE]->(r:Role){industry_join}
         WHERE {filters}
         RETURN DISTINCT {return_cols}
         LIMIT @limit
@@ -302,7 +302,7 @@ def search_experts_by_keyword(
 ) -> dict:
     """Search experts via keyword → knowledge artifact → expert path.
 
-    Traversal path: Keyword → [MENTIONED_IN] → KnowledgeArtifact → [RELEVANT_EMPLOYMENT] → EmploymentRecord → Expert
+    Traversal path: Keyword → [MENTIONED_IN] → KnowledgeArtifact → [RELEVANT_EMPLOYMENT_MENTIONED] → EmploymentRecord → Expert
 
     Args:
         keyword: Keyword text (case-insensitive substring match).
@@ -310,12 +310,12 @@ def search_experts_by_keyword(
     """
     sql = """
         GRAPH kg_graph
-        MATCH (kw:Keyword)-[:MENTIONED_IN]->(ka:KnowledgeArtifact)-[:RELEVANT_EMPLOYMENT]->(er:EmploymentRecord)<-[:HAS_EMPLOYMENT]-(e:Expert)
-        WHERE LOWER(kw.keyword) LIKE LOWER(@keyword)
+        MATCH (kw:Keyword)-[:MENTIONED_IN]->(ka:KnowledgeArtifact)-[:RELEVANT_EMPLOYMENT_MENTIONED]->(er:EmploymentRecord)<-[:HAS_EMPLOYMENT]-(e:Expert)
+        WHERE LOWER(kw.term_string) LIKE LOWER(@keyword)
         RETURN DISTINCT
             e.expert_id,
-            e.expert_name,
-            kw.keyword,
+            e.name,
+            kw.term_string,
             ka.artifact_id,
             er.jobtitle_raw,
             er.is_current
@@ -364,7 +364,7 @@ def expand_keyword_to_experts(
     try:
         kw_rows = _run_gql(
             db,
-            "SELECT keyword_id, keyword FROM keyword WHERE LOWER(keyword) LIKE LOWER(@kw)",
+            "SELECT keyword_id, term_string FROM keyword WHERE LOWER(term_string) LIKE LOWER(@kw)",
             params={"kw": f"%{keyword}%"},
             types={"kw": spanner.param_types.STRING},
         )
@@ -474,7 +474,7 @@ def expand_keyword_to_experts(
                 MATCH (e:Expert)-[:HAS_EMPLOYMENT]->(er:EmploymentRecord)-[iw:INVOLVED_WITH]->(p:Product)
                 WHERE p.product_id IN UNNEST(@pids)
                 RETURN DISTINCT
-                    e.expert_id, e.expert_name, er.jobtitle_raw, er.is_current,
+                    e.expert_id, e.name, er.jobtitle_raw, er.is_current,
                     p.product_name, iw.supply_chain_position
                 LIMIT @limit
                 """,
@@ -499,8 +499,8 @@ def expand_keyword_to_experts(
                 MATCH (e:Expert)-[:HAS_EMPLOYMENT]->(er:EmploymentRecord)-[:AT_COMPANY]->(c:Company)-[:IN_INDUSTRY]->(i:Industry)
                 WHERE i.industry_id IN UNNEST(@iids)
                 RETURN DISTINCT
-                    e.expert_id, e.expert_name, er.jobtitle_raw, er.is_current,
-                    c.company_name, i.name AS industry_name
+                    e.expert_id, e.name, er.jobtitle_raw, er.is_current,
+                    c.name_raw, i.name AS industry_name
                 LIMIT @limit
                 """,
                 params={"iids": industry_ids, "limit": limit},
@@ -521,10 +521,10 @@ def expand_keyword_to_experts(
                 db,
                 """
                 GRAPH kg_graph
-                MATCH (e:Expert)-[:HAS_EMPLOYMENT]->(er:EmploymentRecord)-[:HAS_ROLE]->(r:Role)
+                MATCH (e:Expert)-[:HAS_EMPLOYMENT]->(er:EmploymentRecord)-[:IN_ROLE]->(r:Role)
                 WHERE r.function IN UNNEST(@fns)
                 RETURN DISTINCT
-                    e.expert_id, e.expert_name, er.jobtitle_raw, er.is_current,
+                    e.expert_id, e.name, er.jobtitle_raw, er.is_current,
                     r.function, r.seniority
                 LIMIT @limit
                 """,
@@ -583,7 +583,7 @@ def search_experts_multi_hop(
     # Base path: Expert → EmploymentRecord
     # Branch 1: er -[INVOLVED_WITH]-> Product
     # Branch 2: er -[AT_COMPANY]-> Company -[IN_INDUSTRY]-> Industry
-    # Branch 3: er -[HAS_ROLE]-> Role
+    # Branch 3: er -[IN_ROLE]-> Role
     # All branches share the same er node via comma-separated MATCH patterns.
 
     where_parts: list[str] = []
@@ -612,12 +612,12 @@ def search_experts_multi_hop(
             extra_paths.append("(er)-[:AT_COMPANY]->(c:Company)")
 
         if company_name:
-            where_parts.append("LOWER(c.company_name) LIKE LOWER(@company_name)")
+            where_parts.append("LOWER(c.name_raw) LIKE LOWER(@company_name)")
             params["company_name"] = f"%{company_name}%"
             param_types["company_name"] = spanner.param_types.STRING
 
     if function:
-        extra_paths.append("(er)-[:HAS_ROLE]->(r:Role)")
+        extra_paths.append("(er)-[:IN_ROLE]->(r:Role)")
         where_parts.append("r.function = @function")
         params["function"] = function
         param_types["function"] = spanner.param_types.STRING
@@ -627,11 +627,11 @@ def search_experts_multi_hop(
         params["is_current"] = is_current_role
         param_types["is_current"] = spanner.param_types.BOOL
 
-    return_cols = ["e.expert_id", "e.expert_name", "er.jobtitle_raw", "er.is_current"]
+    return_cols = ["e.expert_id", "e.name", "er.jobtitle_raw", "er.is_current"]
     if product_name:
         return_cols += ["p.product_name", "iw.supply_chain_position"]
     if company_name or industry_name:
-        return_cols.append("c.company_name")
+        return_cols.append("c.name_raw")
     if industry_name:
         return_cols.append("i.name AS industry_name")
     if function:
@@ -669,11 +669,11 @@ def get_expert_profile(expert_id: str) -> dict:
     sql = """
         GRAPH kg_graph
         MATCH (e:Expert)-[:HAS_EMPLOYMENT]->(er:EmploymentRecord)-[:AT_COMPANY]->(c:Company),
-              (er)-[:HAS_ROLE]->(r:Role)
+              (er)-[:IN_ROLE]->(r:Role)
         WHERE e.expert_id = @expert_id
         RETURN
-            e.expert_id, e.expert_name, e.is_active, e.skills,
-            c.company_name, c.company_type,
+            e.expert_id, e.name, e.is_active, e.skills,
+            c.name_raw, c.company_type,
             er.jobtitle_raw, er.position,
             r.function, r.seniority,
             er.start_year, er.end_year, er.is_current,
@@ -728,8 +728,8 @@ def get_coverage_diagnostics(
     if company_name:
         with _get_kg_db().snapshot() as s:
             rows = list(s.execute_sql(
-                "SELECT company_name, expert_count, ambiguity_flag FROM company "
-                "WHERE LOWER(company_name) LIKE LOWER(@name) LIMIT 5",
+                "SELECT name_raw, expert_count, ambiguity_flag FROM company "
+                "WHERE LOWER(name_raw) LIKE LOWER(@name) LIMIT 5",
                 params={"name": f"%{company_name}%"},
                 param_types={"name": spanner.param_types.STRING},
             ))
@@ -770,9 +770,9 @@ def check_company_disambiguation(company_name: str) -> dict:
         # Query 1: find matching companies
         with db.snapshot() as snapshot:
             company_rows = list(snapshot.execute_sql(
-                "SELECT company_id, company_name, expert_count, ambiguity_flag "
+                "SELECT company_id, name_raw, expert_count, ambiguity_flag "
                 "FROM company "
-                "WHERE LOWER(company_name) LIKE LOWER(@name) LIMIT 10",
+                "WHERE LOWER(name_raw) LIKE LOWER(@name) LIMIT 10",
                 params={"name": f"%{company_name}%"},
                 param_types={"name": spanner.param_types.STRING},
             ))
@@ -783,7 +783,7 @@ def check_company_disambiguation(company_name: str) -> dict:
         matches = [
             {
                 "company_id": r[0],
-                "company_name": r[1],
+                "name_raw": r[1],
                 "expert_count": r[2],
                 "ambiguity_flag": r[3],
             }
@@ -947,14 +947,14 @@ def _churn_employment(
     sql = """
         GRAPH kg_graph
         MATCH (e:Expert)-[:HAS_EMPLOYMENT]->(er:EmploymentRecord)-[:AT_COMPANY]->(c:Company)
-        WHERE LOWER(c.company_name) LIKE LOWER(@name)
+        WHERE LOWER(c.name_raw) LIKE LOWER(@name)
           AND er.is_current = false
           AND er.end_year IS NOT NULL
           AND (er.end_year > @cutoff_year
                OR (er.end_year = @cutoff_year AND er.end_month >= @cutoff_month))
         RETURN DISTINCT
-            e.expert_id, e.expert_name,
-            c.company_name,
+            e.expert_id, e.name,
+            c.name_raw,
             er.jobtitle_raw, er.position,
             er.end_year, er.end_month,
             er.start_year
@@ -990,7 +990,7 @@ def _churn_involvement(
           AND iw.end_date IS NOT NULL
           AND iw.end_date >= @cutoff_str
         RETURN DISTINCT
-            e.expert_id, e.expert_name,
+            e.expert_id, e.name,
             p.product_name,
             iw.supply_chain_position,
             iw.end_date,
@@ -1043,14 +1043,14 @@ def _churn_relationship(
 
     customer_sql = """
         SELECT
-            ec.from_company_id, c_from.company_name AS from_company,
-            ec.to_company_id, c_to.company_name AS to_company,
+            ec.buyer_company_id, c_from.name_raw AS from_company,
+            ec.seller_company_id, c_to.name_raw AS to_company,
             ec.end_date, ec.status, 'customer' AS relation_type
         FROM edge_customer_of ec
-        JOIN company c_from ON ec.from_company_id = c_from.company_id
-        JOIN company c_to ON ec.to_company_id = c_to.company_id
-        WHERE (LOWER(c_from.company_name) LIKE LOWER(@name)
-               OR LOWER(c_to.company_name) LIKE LOWER(@name))
+        JOIN company c_from ON ec.buyer_company_id = c_from.company_id
+        JOIN company c_to ON ec.seller_company_id = c_to.company_id
+        WHERE (LOWER(c_from.name_raw) LIKE LOWER(@name)
+               OR LOWER(c_to.name_raw) LIKE LOWER(@name))
           AND ec.end_date IS NOT NULL
           AND ec.end_date >= @cutoff_str
         LIMIT @limit
@@ -1058,14 +1058,14 @@ def _churn_relationship(
 
     supplier_sql = """
         SELECT
-            es.from_company_id, c_from.company_name AS from_company,
-            es.to_company_id, c_to.company_name AS to_company,
+            es.supplier_company_id, c_from.name_raw AS from_company,
+            es.buyer_company_id, c_to.name_raw AS to_company,
             es.end_date, es.status, 'supplier' AS relation_type
         FROM edge_supplier_of es
-        JOIN company c_from ON es.from_company_id = c_from.company_id
-        JOIN company c_to ON es.to_company_id = c_to.company_id
-        WHERE (LOWER(c_from.company_name) LIKE LOWER(@name)
-               OR LOWER(c_to.company_name) LIKE LOWER(@name))
+        JOIN company c_from ON es.supplier_company_id = c_from.company_id
+        JOIN company c_to ON es.buyer_company_id = c_to.company_id
+        WHERE (LOWER(c_from.name_raw) LIKE LOWER(@name)
+               OR LOWER(c_to.name_raw) LIKE LOWER(@name))
           AND es.end_date IS NOT NULL
           AND es.end_date >= @cutoff_str
         LIMIT @limit

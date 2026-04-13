@@ -108,7 +108,7 @@ def _format_disambiguation(disambiguation: dict) -> str:
     lines = [f"The company name **'{name}'** is ambiguous. Multiple entities match:"]
 
     for match in matches:
-        company_name = match.get("company_name", "unknown")
+        company_name = match.get("name_raw", "unknown")
         expert_count = match.get("expert_count", 0)
         company_id = match.get("company_id", "")
         flag = " (flagged)" if match.get("ambiguity_flag") else ""
@@ -146,14 +146,14 @@ def _format_temporal(temporal: dict) -> str:
 
     for r in results[:10]:
         if churn_type == "employment":
-            name = r.get("expert_name", "unknown")
+            name = r.get("name", "unknown")
             title = r.get("jobtitle_raw", "")
             end_y = r.get("end_year", "?")
             end_m = r.get("end_month")
             date_str = f"{end_y}-{end_m:02d}" if isinstance(end_m, int) else str(end_y)
             lines.append(f"- **{name}** — {title}, left ~{date_str}")
         elif churn_type == "involvement":
-            name = r.get("expert_name", "unknown")
+            name = r.get("name", "unknown")
             product = r.get("product_name", "")
             end_date = r.get("end_date", "?")
             lines.append(f"- **{name}** — stopped using {product}, ended {end_date}")

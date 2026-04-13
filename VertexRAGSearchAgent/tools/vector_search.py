@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 _PROJECT = os.getenv("GCP_PROJECT_ID", "gcp-poc-488614")
 _REGION = os.getenv("GCP_REGION", "us-central1")
 _INSTANCE = os.getenv("SPANNER_INSTANCE_ID", "kg-dev-instance")
-_KG_DB = os.getenv("SPANNER_DATABASE_ID", "kg_products_v4_dev")
+_KG_DB = os.getenv("SPANNER_DATABASE_ID", "kg_products_v5_dev")
 _DEFAULT_LIMIT = 20
 
 # Embedding model — must match what 07_generate_embeddings.py wrote.
@@ -148,7 +148,7 @@ def _embed_query(query_text: str) -> list[float]:
 _VECTOR_SEARCH_SQL = """
 SELECT
     e.expert_id,
-    e.expert_name,
+    e.name,
     'artifact' AS match_source,
     ka.artifact_id AS match_id,
     ka.artifact_type AS match_type,
@@ -159,7 +159,7 @@ SELECT
     er.start_year,
     er.end_year,
     ere.context_type,
-    c.company_name,
+    c.name_raw,
     COSINE_DISTANCE(ka.text_embedding, @q_emb) AS distance
 FROM knowledge_artifact ka
 JOIN edge_relevant_employment ere
@@ -178,7 +178,7 @@ UNION ALL
 
 SELECT
     e.expert_id,
-    e.expert_name,
+    e.name,
     'responsibility' AS match_source,
     er.employment_id AS match_id,
     CAST(NULL AS STRING) AS match_type,
@@ -189,7 +189,7 @@ SELECT
     er.start_year,
     er.end_year,
     CAST(NULL AS STRING) AS context_type,
-    c.company_name,
+    c.name_raw,
     COSINE_DISTANCE(er.responsibilities_embedding, @q_emb) AS distance
 FROM employment_record er
 JOIN expert e
@@ -243,14 +243,14 @@ def search_experts_by_vector(
             - query_type: always "vector"
             - count: number of experts returned
             - results: list of dicts, each containing:
-                - expert_id, expert_name
+                - expert_id, name
                 - match_source: "artifact" | "responsibility"
                 - match_id: artifact_id or employment_id (depending on source)
                 - match_type: artifact_type (e.g. "Transcript") or None
                 - match_text: the matched chunk, truncated to 1500 chars
                 - employment_id, jobtitle_raw, is_current, start_year, end_year
                 - context_type (artifact branch only)
-                - company_name (may be None)
+                - name_raw (may be None)
                 - distance: cosine distance (lower = better)
                 - similarity: 1 - distance (higher = better)
             - error: present only when the call failed
