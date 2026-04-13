@@ -25,7 +25,7 @@ _MAX_EXPERTS_OUTPUT = 20
 class RankedExpert(BaseModel):
     """A single expert with relevance score and ranking justification."""
 
-    expert_name: str = Field(description="Full name of the expert")
+    name: str = Field(description="Full name of the expert")
     relevance_score: float = Field(
         description="Relevance score from 0.0 (irrelevant) to 1.0 (perfect match)",
         ge=0.0, le=1.0,
@@ -113,14 +113,14 @@ def merge_and_dedup(
 
     for result in graph_results:
         result_copy = {**result, "_source": "graph"}
-        name = _normalize_name(result_copy.get("expert_name", ""))
+        name = _normalize_name(result_copy.get("name", ""))
         if not name:
             continue
         seen[name] = result_copy
 
     for result in vector_results:
         result_copy = {**result, "_source": "vector"}
-        name = _normalize_name(result_copy.get("expert_name", ""))
+        name = _normalize_name(result_copy.get("name", ""))
         if not name:
             continue
 
@@ -196,16 +196,16 @@ def run_reranker(
 
         # Enrich each ranked expert with original data
         originals_by_name = {
-            _normalize_name(r.get("expert_name", "")): r
+            _normalize_name(r.get("name", "")): r
             for r in merged_results
         }
 
         ranked = []
         for expert in experts[:_MAX_EXPERTS_OUTPUT]:
-            name = _normalize_name(expert.get("expert_name", ""))
+            name = _normalize_name(expert.get("name", ""))
             original = originals_by_name.get(name, {})
             ranked.append({
-                "expert_name": expert.get("expert_name", "unknown"),
+                "name": expert.get("name", "unknown"),
                 "relevance_score": expert.get("relevance_score", 0.0),
                 "rank": expert.get("rank", 0),
                 "ranking_reasoning": expert.get("ranking_reasoning", ""),

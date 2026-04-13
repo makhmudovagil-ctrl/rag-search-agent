@@ -53,9 +53,9 @@ def find_ambiguous_groups(db: SpannerDatabase) -> list[list[str]]:
         sharing the same normalized name.
     """
     sql = """
-        SELECT LOWER(company_name) AS norm_name, ARRAY_AGG(company_id) AS ids
+        SELECT LOWER(name_raw) AS norm_name, ARRAY_AGG(company_id) AS ids
         FROM company
-        GROUP BY LOWER(company_name)
+        GROUP BY LOWER(name_raw)
         HAVING COUNT(*) >= 2
     """
     groups = []

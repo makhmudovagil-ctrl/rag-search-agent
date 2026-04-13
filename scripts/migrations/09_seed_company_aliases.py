@@ -175,7 +175,7 @@ def lookup_company_id(db: SpannerDatabase, company_name: str) -> str | None:
     """
     with db.snapshot() as snapshot:
         rows = list(snapshot.execute_sql(
-            "SELECT company_id FROM company WHERE company_name = @name LIMIT 1",
+            "SELECT company_id FROM company WHERE name_raw = @name LIMIT 1",
             params={"name": company_name},
             param_types={"name": spanner.param_types.STRING},
         ))
