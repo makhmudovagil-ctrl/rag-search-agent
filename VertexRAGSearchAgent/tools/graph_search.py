@@ -8,6 +8,7 @@ Queries two databases:
 
 import os
 import logging
+from datetime import datetime, timedelta
 from typing import Optional
 
 import google.auth
@@ -334,6 +335,218 @@ def search_experts_by_keyword(
         return {"query_type": "keyword", "count": 0, "results": [], "error": str(e)}
 
 
+def expand_keyword_to_experts(
+    keyword: str,
+    limit: int = _DEFAULT_LIMIT,
+) -> dict:
+    """Expand a keyword into experts via product/industry/function edge tables.
+
+    Three-step process:
+      1. Resolve keyword text → keyword_ids from the keyword table
+      2. Lookup 4 edge tables: maps_to_product, maps_to_industry,
+         maps_to_function (D3), maps_to_product_category (D4)
+      3. Search experts linked to discovered products, industries, functions
+
+    Args:
+        keyword: Keyword text (case-insensitive substring match).
+        limit: Max expert results per expansion path.
+
+    Returns:
+        Dict with query_type "keyword_expansion", results list, and
+        expansion_paths summary.
+    """
+    db = _get_kg_db()
+    expansion_paths: dict = {
+        "products": [], "industries": [], "functions": [], "categories": [],
+    }
+
+    # ── Step 1: Resolve keyword text → keyword_ids ────────────────────
+    try:
+        kw_rows = _run_gql(
+            db,
+            "SELECT keyword_id, keyword FROM keyword WHERE LOWER(keyword) LIKE LOWER(@kw)",
+            params={"kw": f"%{keyword}%"},
+            types={"kw": spanner.param_types.STRING},
+        )
+    except Exception as e:
+        logger.error("expand_keyword_to_experts — keyword lookup failed: %s", e)
+        return {"query_type": "keyword_expansion", "count": 0, "results": []}
+
+    if not kw_rows:
+        return {"query_type": "keyword_expansion", "count": 0, "results": []}
+
+    kw_ids = [r["keyword_id"] for r in kw_rows]
+
+    # ── Step 2: Lookup edge tables ────────────────────────────────────
+    product_ids: list[str] = []
+    industry_ids: list[str] = []
+    role_functions: list[str] = []
+
+    # 2a — edge_maps_to_product
+    try:
+        rows = _run_gql(
+            db,
+            "SELECT DISTINCT product_id FROM edge_maps_to_product WHERE keyword_id IN UNNEST(@kw_ids)",
+            params={"kw_ids": kw_ids},
+            types={"kw_ids": spanner.param_types.Array(spanner.param_types.STRING)},
+        )
+        product_ids = [r["product_id"] for r in rows]
+        if product_ids:
+            # Resolve product names for expansion_paths
+            name_rows = _run_gql(
+                db,
+                "SELECT product_name FROM product WHERE product_id IN UNNEST(@pids)",
+                params={"pids": product_ids},
+                types={"pids": spanner.param_types.Array(spanner.param_types.STRING)},
+            )
+            expansion_paths["products"] = [r["product_name"] for r in name_rows]
+    except Exception as e:
+        logger.warning("expand_keyword — product edge lookup failed: %s", e)
+
+    # 2b — edge_maps_to_industry
+    try:
+        rows = _run_gql(
+            db,
+            "SELECT DISTINCT industry_id FROM edge_maps_to_industry WHERE keyword_id IN UNNEST(@kw_ids)",
+            params={"kw_ids": kw_ids},
+            types={"kw_ids": spanner.param_types.Array(spanner.param_types.STRING)},
+        )
+        industry_ids = [r["industry_id"] for r in rows]
+        if industry_ids:
+            name_rows = _run_gql(
+                db,
+                "SELECT name FROM industry WHERE industry_id IN UNNEST(@iids)",
+                params={"iids": industry_ids},
+                types={"iids": spanner.param_types.Array(spanner.param_types.STRING)},
+            )
+            expansion_paths["industries"] = [r["name"] for r in name_rows]
+    except Exception as e:
+        logger.warning("expand_keyword — industry edge lookup failed: %s", e)
+
+    # 2c — edge_maps_to_function (D3)
+    try:
+        rows = _run_gql(
+            db,
+            "SELECT DISTINCT role_function FROM edge_maps_to_function "
+            "WHERE keyword_id IN UNNEST(@kw_ids) AND confidence >= 0.5",
+            params={"kw_ids": kw_ids},
+            types={"kw_ids": spanner.param_types.Array(spanner.param_types.STRING)},
+        )
+        role_functions = [r["role_function"] for r in rows]
+        expansion_paths["functions"] = role_functions
+    except Exception as e:
+        logger.warning("expand_keyword — function edge lookup failed: %s", e)
+
+    # 2d — edge_maps_to_product_category (D4, informational)
+    try:
+        rows = _run_gql(
+            db,
+            "SELECT DISTINCT product_category_id FROM edge_maps_to_product_category "
+            "WHERE keyword_id IN UNNEST(@kw_ids) AND confidence >= 0.5",
+            params={"kw_ids": kw_ids},
+            types={"kw_ids": spanner.param_types.Array(spanner.param_types.STRING)},
+        )
+        expansion_paths["categories"] = [r["product_category_id"] for r in rows]
+    except Exception as e:
+        logger.warning("expand_keyword — category edge lookup failed: %s", e)
+
+    # ── Step 3: Search experts by discovered entities ─────────────────
+    all_experts: list[dict] = []
+    seen_expert_ids: set[str] = set()
+
+    def _add_experts(rows: list[dict], entity_type: str, entity_name: str) -> None:
+        for row in rows:
+            eid = row.get("expert_id", "")
+            if eid and eid not in seen_expert_ids:
+                seen_expert_ids.add(eid)
+                row["expansion_path"] = f"keyword '{keyword}' -> {entity_type} '{entity_name}'"
+                row["matched_entity_type"] = entity_type
+                row["matched_entity_name"] = entity_name
+                all_experts.append(row)
+
+    # 3a — Experts by product_ids
+    if product_ids:
+        try:
+            rows = _run_gql(
+                db,
+                """
+                GRAPH kg_graph
+                MATCH (e:Expert)-[:HAS_EMPLOYMENT]->(er:EmploymentRecord)-[iw:INVOLVED_WITH]->(p:Product)
+                WHERE p.product_id IN UNNEST(@pids)
+                RETURN DISTINCT
+                    e.expert_id, e.expert_name, er.jobtitle_raw, er.is_current,
+                    p.product_name, iw.supply_chain_position
+                LIMIT @limit
+                """,
+                params={"pids": product_ids, "limit": limit},
+                types={
+                    "pids": spanner.param_types.Array(spanner.param_types.STRING),
+                    "limit": spanner.param_types.INT64,
+                },
+            )
+            for r in rows:
+                _add_experts([r], "product", r.get("product_name", "unknown"))
+        except Exception as e:
+            logger.warning("expand_keyword — expert-by-product search failed: %s", e)
+
+    # 3b — Experts by industry_ids
+    if industry_ids:
+        try:
+            rows = _run_gql(
+                db,
+                """
+                GRAPH kg_graph
+                MATCH (e:Expert)-[:HAS_EMPLOYMENT]->(er:EmploymentRecord)-[:AT_COMPANY]->(c:Company)-[:IN_INDUSTRY]->(i:Industry)
+                WHERE i.industry_id IN UNNEST(@iids)
+                RETURN DISTINCT
+                    e.expert_id, e.expert_name, er.jobtitle_raw, er.is_current,
+                    c.company_name, i.name AS industry_name
+                LIMIT @limit
+                """,
+                params={"iids": industry_ids, "limit": limit},
+                types={
+                    "iids": spanner.param_types.Array(spanner.param_types.STRING),
+                    "limit": spanner.param_types.INT64,
+                },
+            )
+            for r in rows:
+                _add_experts([r], "industry", r.get("industry_name", "unknown"))
+        except Exception as e:
+            logger.warning("expand_keyword — expert-by-industry search failed: %s", e)
+
+    # 3c — Experts by role_functions
+    if role_functions:
+        try:
+            rows = _run_gql(
+                db,
+                """
+                GRAPH kg_graph
+                MATCH (e:Expert)-[:HAS_EMPLOYMENT]->(er:EmploymentRecord)-[:HAS_ROLE]->(r:Role)
+                WHERE r.function IN UNNEST(@fns)
+                RETURN DISTINCT
+                    e.expert_id, e.expert_name, er.jobtitle_raw, er.is_current,
+                    r.function, r.seniority
+                LIMIT @limit
+                """,
+                params={"fns": role_functions, "limit": limit},
+                types={
+                    "fns": spanner.param_types.Array(spanner.param_types.STRING),
+                    "limit": spanner.param_types.INT64,
+                },
+            )
+            for r in rows:
+                _add_experts([r], "function", r.get("function", "unknown"))
+        except Exception as e:
+            logger.warning("expand_keyword — expert-by-function search failed: %s", e)
+
+    return {
+        "query_type": "keyword_expansion",
+        "count": len(all_experts),
+        "results": all_experts,
+        "expansion_paths": expansion_paths,
+    }
+
+
 def search_experts_multi_hop(
     product_name: Optional[str] = None,
     industry_name: Optional[str] = None,
@@ -532,3 +745,352 @@ def get_coverage_diagnostics(
             }
 
     return diagnostics
+
+
+def check_company_disambiguation(company_name: str) -> dict:
+    """Check if a company name is ambiguous and return aliases.
+
+    Queries the company table for matches, checks ambiguity_flag, and fetches
+    any known aliases from company_alias. Used by Scout to surface
+    disambiguation notices when company names are ambiguous.
+
+    Args:
+        company_name: Company name to check (case-insensitive substring match).
+
+    Returns:
+        Dict with 'status' key:
+        - "not_found": no matching company in database
+        - "unambiguous": exactly one match, not flagged
+        - "ambiguous": multiple matches or ambiguity_flag is true
+        - "error": query failed
+    """
+    try:
+        db = _get_kg_db()
+
+        # Query 1: find matching companies
+        with db.snapshot() as snapshot:
+            company_rows = list(snapshot.execute_sql(
+                "SELECT company_id, company_name, expert_count, ambiguity_flag "
+                "FROM company "
+                "WHERE LOWER(company_name) LIKE LOWER(@name) LIMIT 10",
+                params={"name": f"%{company_name}%"},
+                param_types={"name": spanner.param_types.STRING},
+            ))
+
+        if not company_rows:
+            return {"status": "not_found", "name": company_name}
+
+        matches = [
+            {
+                "company_id": r[0],
+                "company_name": r[1],
+                "expert_count": r[2],
+                "ambiguity_flag": r[3],
+            }
+            for r in company_rows
+        ]
+
+        # Query 2: fetch aliases for ALL matched company_ids
+        company_ids = [r[0] for r in company_rows]
+        aliases = []
+        with db.snapshot() as snapshot:
+            alias_rows = list(snapshot.execute_sql(
+                "SELECT alias_id, alias_name, alias_type, company_id "
+                "FROM company_alias "
+                "WHERE company_id IN UNNEST(@ids)",
+                params={"ids": company_ids},
+                param_types={"ids": spanner.param_types.Array(spanner.param_types.STRING)},
+            ))
+        aliases = [
+            {
+                "alias_name": r[1],
+                "alias_type": r[2],
+                "company_id": r[3],
+            }
+            for r in alias_rows
+        ]
+
+        # Determine ambiguity: flagged OR multiple distinct matches
+        any_flagged = any(m.get("ambiguity_flag") for m in matches)
+        is_ambiguous = any_flagged or len(matches) > 1
+
+        if is_ambiguous:
+            return {
+                "status": "ambiguous",
+                "name": company_name,
+                "matches": matches,
+                "aliases": aliases,
+            }
+
+        # Single unambiguous match
+        result = {"status": "unambiguous", "company": matches[0]}
+        if aliases:
+            result["aliases"] = aliases
+        return result
+
+    except Exception as e:
+        logger.error("check_company_disambiguation failed: %s", e)
+        return {"status": "error", "error": str(e)}
+
+
+# ── Temporal search (P2.3) ────────────────────────────────────────────────────
+
+
+def _parse_end_date(date_str: str) -> Optional[tuple[int, int]]:
+    """Parse end_date STRING(16) into (year, month) tuple.
+
+    Handles formats: "YYYY-MM-DD", "YYYY-MM", "YYYY".
+
+    Args:
+        date_str: Date string from Spanner column.
+
+    Returns:
+        Tuple of (year, month) or None if unparseable.
+    """
+    if not date_str or not isinstance(date_str, str):
+        return None
+    s = date_str.strip()
+    try:
+        if len(s) >= 10:  # "YYYY-MM-DD"
+            return int(s[:4]), int(s[5:7])
+        if len(s) >= 7:   # "YYYY-MM"
+            return int(s[:4]), int(s[5:7])
+        if len(s) >= 4:   # "YYYY"
+            return int(s[:4]), 1
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+def find_recent_churn(
+    entity_name: str,
+    duration_months: int = 12,
+    churn_type: str = "employment",
+    limit: int = _DEFAULT_LIMIT,
+) -> dict:
+    """Find experts or companies with recently ended relationships.
+
+    Programmatic date-math tool that handles temporal queries like
+    "Who left Shell in the last year?" without relying on LLM-generated
+    date queries.
+
+    Args:
+        entity_name: Company or product name (case-insensitive substring match).
+        duration_months: How far back to look (default 12, clamped to [1, 120]).
+        churn_type: Type of churn — "employment" (expert left company),
+            "involvement" (expert stopped using product), or "relationship"
+            (company-to-company customer/supplier ended).
+        limit: Max number of results to return.
+
+    Returns:
+        Dict with query_type="temporal_churn", churn_type, entity_name,
+        duration_months, cutoff, count, and results list.
+    """
+    # Input validation
+    if not entity_name:
+        return {
+            "query_type": "temporal_churn", "churn_type": churn_type,
+            "entity_name": "", "duration_months": 0,
+            "cutoff": "", "count": 0, "results": [],
+        }
+
+    if duration_months < 1:
+        logger.warning("duration_months %d clamped to 1", duration_months)
+        duration_months = 1
+    elif duration_months > 120:
+        logger.warning("duration_months %d clamped to 120", duration_months)
+        duration_months = 120
+
+    valid_types = ("employment", "involvement", "relationship")
+    if churn_type not in valid_types:
+        logger.warning("Unknown churn_type '%s', defaulting to 'employment'", churn_type)
+        churn_type = "employment"
+
+    # Compute cutoff date
+    now = datetime.now()
+    cutoff_date = now - timedelta(days=duration_months * 30)
+    cutoff_year = cutoff_date.year
+    cutoff_month = cutoff_date.month
+    cutoff_str = f"{cutoff_year}-{cutoff_month:02d}"
+
+    base_result = {
+        "query_type": "temporal_churn",
+        "churn_type": churn_type,
+        "entity_name": entity_name,
+        "duration_months": duration_months,
+        "cutoff": cutoff_str,
+    }
+
+    try:
+        if churn_type == "employment":
+            results = _churn_employment(entity_name, cutoff_year, cutoff_month, limit)
+        elif churn_type == "involvement":
+            results = _churn_involvement(entity_name, cutoff_str, limit)
+        else:
+            results = _churn_relationship(entity_name, cutoff_str, limit)
+
+        return {**base_result, "count": len(results), "results": results}
+
+    except Exception as e:
+        logger.error("find_recent_churn failed: %s", e)
+        return {**base_result, "count": 0, "results": [], "error": str(e)}
+
+
+def _churn_employment(
+    company_name: str, cutoff_year: int, cutoff_month: int, limit: int,
+) -> list[dict]:
+    """Query experts who left a company after the cutoff date.
+
+    Uses employment_record.end_year / end_month INT64 columns for reliable
+    date filtering without string parsing.
+    """
+    sql = """
+        GRAPH kg_graph
+        MATCH (e:Expert)-[:HAS_EMPLOYMENT]->(er:EmploymentRecord)-[:AT_COMPANY]->(c:Company)
+        WHERE LOWER(c.company_name) LIKE LOWER(@name)
+          AND er.is_current = false
+          AND er.end_year IS NOT NULL
+          AND (er.end_year > @cutoff_year
+               OR (er.end_year = @cutoff_year AND er.end_month >= @cutoff_month))
+        RETURN DISTINCT
+            e.expert_id, e.expert_name,
+            c.company_name,
+            er.jobtitle_raw, er.position,
+            er.end_year, er.end_month,
+            er.start_year
+        LIMIT @limit
+    """
+    params = {
+        "name": f"%{company_name}%",
+        "cutoff_year": cutoff_year,
+        "cutoff_month": cutoff_month,
+        "limit": limit,
+    }
+    param_types = {
+        "name": spanner.param_types.STRING,
+        "cutoff_year": spanner.param_types.INT64,
+        "cutoff_month": spanner.param_types.INT64,
+        "limit": spanner.param_types.INT64,
+    }
+    return _run_gql(_get_kg_db(), sql, params, param_types)
+
+
+def _churn_involvement(
+    product_name: str, cutoff_str: str, limit: int,
+) -> list[dict]:
+    """Query experts who stopped using a product after the cutoff date.
+
+    Uses edge_involved_with.end_date STRING(16) with lexicographic comparison
+    at SQL level, plus Python-side validation of parsed dates.
+    """
+    sql = """
+        GRAPH kg_graph
+        MATCH (e:Expert)-[:HAS_EMPLOYMENT]->(er:EmploymentRecord)-[iw:INVOLVED_WITH]->(p:Product)
+        WHERE LOWER(p.product_name) LIKE LOWER(@name)
+          AND iw.end_date IS NOT NULL
+          AND iw.end_date >= @cutoff_str
+        RETURN DISTINCT
+            e.expert_id, e.expert_name,
+            p.product_name,
+            iw.supply_chain_position,
+            iw.end_date,
+            er.jobtitle_raw
+        LIMIT @limit
+    """
+    params = {
+        "name": f"%{product_name}%",
+        "cutoff_str": cutoff_str,
+        "limit": limit,
+    }
+    param_types = {
+        "name": spanner.param_types.STRING,
+        "cutoff_str": spanner.param_types.STRING,
+        "limit": spanner.param_types.INT64,
+    }
+    rows = _run_gql(_get_kg_db(), sql, params, param_types)
+
+    # Post-query validation: skip rows with unparseable dates
+    validated = []
+    for row in rows:
+        parsed = _parse_end_date(row.get("end_date", ""))
+        if parsed is None:
+            logger.debug("Skipping row with unparseable end_date: %s", row.get("end_date"))
+            continue
+        validated.append(row)
+    return validated
+
+
+def _churn_relationship(
+    company_name: str, cutoff_str: str, limit: int,
+) -> list[dict]:
+    """Query company-to-company relationships (customer/supplier) that ended.
+
+    Uses plain SQL (not GQL) because edge_customer_of / edge_supplier_of are
+    company-to-company edges not traversed through Expert nodes. Queries both
+    tables and merges results with a relation_type tag.
+    """
+    db = _get_kg_db()
+    params = {
+        "name": f"%{company_name}%",
+        "cutoff_str": cutoff_str,
+        "limit": limit,
+    }
+    param_types = {
+        "name": spanner.param_types.STRING,
+        "cutoff_str": spanner.param_types.STRING,
+        "limit": spanner.param_types.INT64,
+    }
+
+    customer_sql = """
+        SELECT
+            ec.from_company_id, c_from.company_name AS from_company,
+            ec.to_company_id, c_to.company_name AS to_company,
+            ec.end_date, ec.status, 'customer' AS relation_type
+        FROM edge_customer_of ec
+        JOIN company c_from ON ec.from_company_id = c_from.company_id
+        JOIN company c_to ON ec.to_company_id = c_to.company_id
+        WHERE (LOWER(c_from.company_name) LIKE LOWER(@name)
+               OR LOWER(c_to.company_name) LIKE LOWER(@name))
+          AND ec.end_date IS NOT NULL
+          AND ec.end_date >= @cutoff_str
+        LIMIT @limit
+    """
+
+    supplier_sql = """
+        SELECT
+            es.from_company_id, c_from.company_name AS from_company,
+            es.to_company_id, c_to.company_name AS to_company,
+            es.end_date, es.status, 'supplier' AS relation_type
+        FROM edge_supplier_of es
+        JOIN company c_from ON es.from_company_id = c_from.company_id
+        JOIN company c_to ON es.to_company_id = c_to.company_id
+        WHERE (LOWER(c_from.company_name) LIKE LOWER(@name)
+               OR LOWER(c_to.company_name) LIKE LOWER(@name))
+          AND es.end_date IS NOT NULL
+          AND es.end_date >= @cutoff_str
+        LIMIT @limit
+    """
+
+    # Two separate snapshots (Spanner single-use snapshot cannot be reused)
+    with db.snapshot() as snapshot:
+        customer_result = snapshot.execute_sql(customer_sql, params=params, param_types=param_types)
+        customer_rows = list(customer_result)
+        customer_fields = [f.name for f in customer_result.fields]
+
+    with db.snapshot() as snapshot:
+        supplier_result = snapshot.execute_sql(supplier_sql, params=params, param_types=param_types)
+        supplier_rows = list(supplier_result)
+        supplier_fields = [f.name for f in supplier_result.fields]
+
+    results = [dict(zip(customer_fields, r)) for r in customer_rows]
+    results += [dict(zip(supplier_fields, r)) for r in supplier_rows]
+
+    # Post-query validation: skip rows with unparseable dates
+    validated = []
+    for row in results:
+        parsed = _parse_end_date(row.get("end_date", ""))
+        if parsed is None:
+            logger.debug("Skipping row with unparseable end_date: %s", row.get("end_date"))
+            continue
+        validated.append(row)
+    return validated

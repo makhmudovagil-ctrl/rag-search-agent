@@ -1,2 +1,6 @@
-.venv/
+__pycache__/
 *.pyc
+*.egg-info/
+docs/
+.venv/
+session.db

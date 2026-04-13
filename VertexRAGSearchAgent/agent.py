@@ -17,13 +17,15 @@ from google.adk.events import Event, EventActions
 from google.genai import Client
 from google.genai.types import Content, Part, GenerateContentConfig
 
+from VertexRAGSearchAgent.agents.reranker import merge_and_dedup, run_reranker
 from VertexRAGSearchAgent.agents.router import RoutingDecision, ROUTER_INSTRUCTION
 from VertexRAGSearchAgent.agents.scout import ConditionalScoutAgent
 from VertexRAGSearchAgent.agents.synthesizer import _build_instruction as build_synth_instruction
 from VertexRAGSearchAgent.state import (
+    GRAPH_RAW_RESULTS,
+    RERANKED_RESULTS,
     ROUTING_DECISION,
     ROUTING_STRATEGY,
-    GRAPH_RAW_RESULTS,
     VECTOR_RAW_RESULTS,
 )
 
@@ -96,6 +98,17 @@ class RAGSearchAgent(BaseAgent):
             if event.actions and event.actions.state_delta:
                 for key, val in event.actions.state_delta.items():
                     ctx.session.state[key] = val
+
+        # ── Step 2.5: Re-ranker (direct Gemini call, no visible output) ─────
+        graph_list = ctx.session.state.get(GRAPH_RAW_RESULTS, [])
+        vector_list = ctx.session.state.get(VECTOR_RAW_RESULTS, [])
+        merged = merge_and_dedup(graph_list, vector_list)
+
+        if merged:
+            reranked = run_reranker(client, self.model, user_query, merged)
+        else:
+            reranked = []
+        ctx.session.state[RERANKED_RESULTS] = reranked
 
         # ── Step 3: Synthesizer (direct Gemini call, visible output) ────────
         # Build instruction with injected state data

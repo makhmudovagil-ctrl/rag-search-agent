@@ -17,7 +17,8 @@ class SearchParam(BaseModel):
     """A single structured search parameter extracted from the query."""
     param_type: str = Field(
         description="Type of parameter: product, company, industry, function, "
-        "seniority, supply_chain_position, keyword, is_current_role"
+        "seniority, supply_chain_position, keyword, is_current_role, "
+        "temporal_months, churn_type"
     )
     value: str = Field(description="Extracted value for this parameter")
 
@@ -85,6 +86,31 @@ Extract structured parameters for the graph search:
 - **supply_chain_position**: ONLY these 10 values: buyer, seller, user, evaluator, advisor, analyst, operator, competitor, neutral, none
 - **keyword**: Semantic keywords for keyword-based graph search
 - **is_current_role**: "true" or "false" — whether to filter by current employment
+
+## Temporal Signal Detection
+
+When the query asks about RECENT changes, departures, or churn, extract temporal parameters:
+
+Temporal signals: "recently", "in the last N months/years", "former", "who left",
+"stopped using", "no longer", "departed", "churn", "ex-", "previously at"
+
+Extract as search_params:
+- param_type="temporal_months", value="<duration>" (e.g., "12" for 1 year, "24" for 2 years)
+- param_type="churn_type", value="<type>" (optional — omit if unclear, defaults to "employment")
+
+Churn types:
+- "employment" — expert left a company ("Who left Shell?", "Former Deloitte employees")
+- "involvement" — expert stopped using a product ("Who stopped using SAP S/4HANA?")
+- "relationship" — company-to-company customer/supplier ended ("Which companies stopped being customers of Oracle?")
+
+Examples:
+- "Who left Shell in the last year?" → company="Shell", temporal_months="12"
+- "Former Deloitte employees" → company="Deloitte", temporal_months="24"
+- "Who stopped using SAP recently?" → product="SAP", temporal_months="12", churn_type="involvement"
+- "Which companies stopped being customers of Oracle in the last 2 years?" → company="Oracle", temporal_months="24", churn_type="relationship"
+
+IMPORTANT: Temporal queries ALSO need the normal entity params (company, product).
+Always include both the entity param AND temporal_months.
 
 ## Available Knowledge Graph Schema
 

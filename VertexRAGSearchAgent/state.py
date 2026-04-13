@@ -9,6 +9,21 @@ ROUTING_DECISION = "rag:routing_decision"          # full routing dict
 GRAPH_RAW_RESULTS = "rag:graph_raw_results"        # list[dict]
 VECTOR_RAW_RESULTS = "rag:vector_raw_results"      # list[dict]
 
+# Coverage diagnostics (P1.3 — sparse result explainer)
+COVERAGE_DIAGNOSTICS = "rag:coverage_diagnostics"   # dict from get_coverage_diagnostics()
+
+# Coverage estimation (P2.4 — "Found X of ~Y experts")
+COVERAGE_ESTIMATE = "rag:coverage_estimate"          # dict from compute_coverage_estimate()
+
+# Re-ranked merged results (P2.1 — Gemini contextual re-ranking)
+RERANKED_RESULTS = "rag:reranked_results"            # list[dict] from run_reranker()
+
+# Entity disambiguation (P1.4 — ambiguous company names)
+DISAMBIGUATION_RESULT = "rag:disambiguation_result"  # dict from check_company_disambiguation()
+
+# Temporal search results (P2.3 — recent churn/departures)
+TEMPORAL_RESULTS = "rag:temporal_results"             # dict from find_recent_churn()
+
 # Multi-turn context
 RETRIEVAL_HISTORY = "rag:retrieval_history"         # list[dict] per turn
 SCHEMA_CACHE = "rag:schema_cache"                  # cached schema lookups
